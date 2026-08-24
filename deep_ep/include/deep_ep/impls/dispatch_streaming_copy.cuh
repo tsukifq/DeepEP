@@ -32,8 +32,11 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kRawLaneRouteCapacity =
         kNumMaxTokensPerRank * (kNumTopk < kNumExpertsPerRank ? kNumTopk : kNumExpertsPerRank);
-    constexpr int kLaneRouteCapacity = kRawLaneRouteCapacity +
+    constexpr int kUnalignedLaneRouteCapacity = kRawLaneRouteCapacity +
         (kNumExpertsPerRank - 1) * (kExpertAlignment - 1);
+    constexpr int kLaneRouteCapacity =
+        (kUnalignedLaneRouteCapacity + kExpertAlignment - 1) /
+        kExpertAlignment * kExpertAlignment;
     constexpr int kMetadataStride = 2 + kNumTopk;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid expert/rank shape");
     EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");

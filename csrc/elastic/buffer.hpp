@@ -214,10 +214,20 @@ public:
             {num_ranks},
             {static_cast<int64_t>(sizeof(streaming::LaneControl) / sizeof(uint64_t))},
             torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+        auto lane_sf = std::optional<torch::Tensor>();
+        if (latest_streaming_packed_sf.has_value()) {
+            const auto& packed_sf = latest_streaming_packed_sf.value();
+            EP_HOST_ASSERT(packed_sf.dim() == 2 and
+                           packed_sf.size(0) == num_ranks * lane_capacity);
+            lane_sf = packed_sf.as_strided(
+                {num_ranks, lane_capacity, packed_sf.size(1)},
+                {lane_capacity * packed_sf.stride(0),
+                 packed_sf.stride(0), packed_sf.stride(1)});
+        }
         return {
             latest_streaming_packed_x->view(
                 {num_ranks, lane_capacity, latest_streaming_packed_x->size(1)}),
-            latest_streaming_packed_sf,
+            lane_sf,
             latest_streaming_packed_topk_weights.has_value() ?
                 std::make_optional(latest_streaming_packed_topk_weights->view(
                     {num_ranks, lane_capacity})) : std::nullopt,
@@ -299,8 +309,11 @@ public:
         const int num_max_tokens_per_rank =
             latest_streaming_packed_src_metadata->size(0) /
             latest_streaming_num_ranks;
+        // Expert GEMM and weighted return always produce BF16, regardless of
+        // whether dispatch transported BF16 or FP8 activations.
         auto combined_x = torch::empty(
-            {num_combined_tokens, hidden}, latest_streaming_packed_x->options());
+            {num_combined_tokens, hidden},
+            latest_streaming_packed_x->options().dtype(torch::kBFloat16));
         const auto stream = at::cuda::getCurrentCUDAStream();
         launch_streaming_combine_reduce(
             combined_x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
@@ -1314,9 +1327,12 @@ public:
         if (run_streaming_copy) {
             const int64_t raw_lane_route_capacity =
                 static_cast<int64_t>(num_max_tokens_per_rank) * std::min(num_topk, num_local_experts);
-            const int64_t lane_route_capacity = raw_lane_route_capacity +
+            const int64_t unaligned_lane_route_capacity = raw_lane_route_capacity +
                 static_cast<int64_t>(num_local_experts - 1) *
                     (streaming::kExpertAlignmentRows - 1);
+            const int64_t lane_route_capacity = math::align(
+                unaligned_lane_route_capacity,
+                static_cast<int64_t>(streaming::kExpertAlignmentRows));
             const int64_t num_streaming_packed_tokens =
                 nccl_context->num_ranks * lane_route_capacity;
             EP_HOST_ASSERT(
