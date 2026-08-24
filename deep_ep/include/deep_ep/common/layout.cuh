@@ -4,6 +4,7 @@
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
+#include <deep_ep/common/streaming.cuh>
 
 namespace deep_ep::elastic::layout {
 
@@ -75,6 +76,23 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Streaming dispatch: one control line and source-local counts per
+        // scaleup source lane. These are separate from the bulk prefix-sum
+        // scratch because the bulk notify path clears that scratch in-place.
+        num_bytes = math::align(
+            num_bytes, static_cast<int64_t>(alignof(streaming::LaneControl)));
+        num_bytes += kNumMaxRanks * sizeof(streaming::LaneControl);
+        num_bytes += kNumMaxRanks * (1 + kNumMaxExpertsPerRank) * sizeof(int64_t);
+        num_bytes += kNumMaxRanks * (1 + kNumMaxExpertsPerRank) * sizeof(int);
+        num_bytes += sizeof(streaming::DispatchSync);
+
+        // Streaming return: destination-indexed controls on each source rank,
+        // plus one source-local layer completion line.
+        num_bytes = math::align(
+            num_bytes, static_cast<int64_t>(alignof(streaming::ReturnControl)));
+        num_bytes += kNumMaxRanks * sizeof(streaming::ReturnControl);
+        num_bytes += sizeof(streaming::LayerControl);
 
         return num_bytes;
     }
@@ -173,6 +191,72 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ streaming::LaneControl* get_streaming_lane_control_ptr(
+        const int& source_rank_idx = 0) const {
+        const auto unaligned_ptr = math::advance_ptr<void>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        const auto aligned_offset = math::align(
+            math::ptr_diff(unaligned_ptr, workspace),
+            static_cast<ptrdiff_t>(alignof(streaming::LaneControl)));
+        const auto base_ptr = math::advance_ptr<streaming::LaneControl>(
+            workspace, aligned_offset);
+        return base_ptr + source_rank_idx;
+    }
+
+    // Layout per source: [unique-token count, local-expert route counts...].
+    __forceinline__ __device__ __host__ int64_t* get_streaming_lane_count_ptr(
+        const int& source_rank_idx = 0, const int& offset = 0) const {
+        const auto base_ptr = math::advance_ptr<int64_t>(
+            get_streaming_lane_control_ptr(0),
+            kNumMaxRanks * sizeof(streaming::LaneControl));
+        return base_ptr + source_rank_idx * (1 + kNumMaxExpertsPerRank) + offset;
+    }
+
+    __forceinline__ __device__ __host__ int64_t* get_streaming_lane_token_count_ptr(
+        const int& source_rank_idx = 0) const {
+        return get_streaming_lane_count_ptr(source_rank_idx, 0);
+    }
+
+    __forceinline__ __device__ __host__ int64_t* get_streaming_lane_expert_count_ptr(
+        const int& source_rank_idx = 0, const int& local_expert_idx = 0) const {
+        return get_streaming_lane_count_ptr(source_rank_idx, 1 + local_expert_idx);
+    }
+
+    __forceinline__ __device__ __host__ streaming::DispatchSync* get_streaming_dispatch_sync_ptr() const {
+        return math::advance_ptr<streaming::DispatchSync>(
+            get_streaming_lane_psum_ptr(0),
+            kNumMaxRanks * (1 + kNumMaxExpertsPerRank) * sizeof(int));
+    }
+
+    __forceinline__ __device__ __host__ streaming::ReturnControl* get_streaming_return_control_ptr(
+        const int& destination_rank_idx = 0) const {
+        const auto unaligned_ptr = math::advance_ptr<void>(
+            get_streaming_dispatch_sync_ptr(), sizeof(streaming::DispatchSync));
+        const auto aligned_offset = math::align(
+            math::ptr_diff(unaligned_ptr, workspace),
+            static_cast<ptrdiff_t>(alignof(streaming::ReturnControl)));
+        const auto base_ptr = math::advance_ptr<streaming::ReturnControl>(
+            workspace, aligned_offset);
+        return base_ptr + destination_rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ streaming::LayerControl* get_streaming_layer_control_ptr() const {
+        return math::advance_ptr<streaming::LayerControl>(
+            get_streaming_return_control_ptr(0),
+            kNumMaxRanks * sizeof(streaming::ReturnControl));
+    }
+
+    // Consumer-produced DeepGEMM psum end offsets. Entry i is the exclusive
+    // end of local expert i after alignment; entry E repeats the lane end for
+    // diagnostics while GEMM consumes entries [0, E).
+    __forceinline__ __device__ __host__ int* get_streaming_lane_psum_ptr(
+        const int& source_rank_idx = 0, const int& local_expert_idx = 0) const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_streaming_lane_count_ptr(0),
+            kNumMaxRanks * (1 + kNumMaxExpertsPerRank) * sizeof(int64_t));
+        return base_ptr + source_rank_idx * (1 + kNumMaxExpertsPerRank) + local_expert_idx;
     }
 };
 

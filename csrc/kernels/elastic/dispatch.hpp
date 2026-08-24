@@ -18,6 +18,7 @@ public:
         bool is_scaleup_nvlink;
         bool do_cpu_sync;
         bool reuse_slot_indices;
+        bool emit_streaming_signals;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -44,6 +45,7 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        uint64_t streaming_generation;
 
         jit::LaunchArgs launch_args;
     };
@@ -52,10 +54,11 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
+                args.emit_streaming_signals,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_dispatch_warps,
                 args.num_scaleup_ranks,
@@ -104,7 +107,8 @@ static void __instantiate_kernel() {{
                 args.nccl_dev_comm, args.nccl_window,
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
-                args.scaleup_rank_idx));
+                args.scaleup_rank_idx,
+                args.streaming_generation));
         } else {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
@@ -161,6 +165,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_smem_bytes,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
+                            const bool& emit_streaming_signals,
+                            const uint64_t& streaming_generation,
                             const bool& do_cpu_sync,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
@@ -200,6 +206,7 @@ static void launch_dispatch(void* x, void* sf,
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
+        .emit_streaming_signals = emit_streaming_signals,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
@@ -222,6 +229,7 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .streaming_generation = streaming_generation,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);
@@ -229,11 +237,182 @@ static void launch_dispatch(void* x, void* sf,
     DispatchRuntime::launch(runtime, args, stream);
 }
 
+class DispatchStreamingCopyRuntime final : public jit::LaunchRuntime<DispatchStreamingCopyRuntime> {
+public:
+    struct Args {
+        // Templated arguments
+        int num_warps, num_ranks;
+        int num_hidden_bytes, num_sf_packs;
+        int num_max_tokens_per_rank;
+        int num_experts, num_topk;
+        int expert_alignment;
+        int64_t num_timeout_cycles;
+
+        // Parameters
+        void *buffer, *workspace;
+        void *packed_x, *packed_sf;
+        float* packed_topk_weights;
+        int* packed_src_metadata;
+        int packed_sf_token_stride, packed_sf_hidden_stride;
+        int destination_rank_idx;
+        uint64_t generation;
+
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_streaming_copy.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_streaming_copy_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
+}}
+)",
+                           args.num_warps, args.num_ranks,
+                           args.num_hidden_bytes, args.num_sf_packs,
+                           args.num_max_tokens_per_rank,
+                           args.num_experts, args.num_topk,
+                           args.num_timeout_cycles, args.expert_alignment);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.buffer, args.workspace,
+            args.packed_x, args.packed_sf,
+            args.packed_topk_weights,
+            args.packed_src_metadata,
+            args.packed_sf_token_stride, args.packed_sf_hidden_stride,
+            args.destination_rank_idx, args.generation));
+    }
+};
+
+static void launch_dispatch_streaming_copy(
+    void* buffer, void* workspace,
+    void* packed_x, void* packed_sf,
+    float* packed_topk_weights,
+    int* packed_src_metadata,
+    const int& packed_sf_token_stride, const int& packed_sf_hidden_stride,
+    const int& destination_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_hidden_bytes, const int& num_sf_packs,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const int& num_smem_bytes,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const auto token_layout = layout::TokenLayout(
+        num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    const auto num_warps = std::min(
+        num_smem_bytes / token_layout.get_num_bytes<true>(), 2);
+    EP_HOST_ASSERT(num_warps > 0);
+    const auto streaming_smem_bytes = num_warps * token_layout.get_num_bytes<true>();
+
+    const DispatchStreamingCopyRuntime::Args args = {
+        .num_warps = num_warps, .num_ranks = num_ranks,
+        .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .num_experts = num_experts, .num_topk = num_topk,
+        .expert_alignment = streaming::kExpertAlignmentRows,
+        .num_timeout_cycles = num_timeout_cycles,
+        .buffer = buffer, .workspace = workspace,
+        .packed_x = packed_x, .packed_sf = packed_sf,
+        .packed_topk_weights = packed_topk_weights,
+        .packed_src_metadata = packed_src_metadata,
+        .packed_sf_token_stride = packed_sf_token_stride,
+        .packed_sf_hidden_stride = packed_sf_hidden_stride,
+        .destination_rank_idx = destination_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(
+            num_ranks, num_warps * 32, streaming_smem_bytes)};
+    const auto code = DispatchStreamingCopyRuntime::generate(args);
+    const auto runtime = jit::compiler->build("dispatch_streaming_copy", code);
+    DispatchStreamingCopyRuntime::launch(runtime, args, stream);
+}
+
+class DispatchRankReadyPrefixRuntime final : public jit::LaunchRuntime<DispatchRankReadyPrefixRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts, expert_alignment;
+        int64_t num_timeout_cycles;
+        void* workspace;
+        int* psum_num_recv_tokens_per_rank;
+        int* psum_num_recv_tokens_per_expert;
+        int* num_unaligned_recv_tokens_per_expert;
+        int* cumulative_local_expert_recv_stats;
+        int destination_rank_idx;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_rank_ready.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_rank_ready_prefix_impl<{}, {}, {}, {}>);
+}}
+)",
+                           args.num_ranks, args.num_experts,
+                           args.expert_alignment, args.num_timeout_cycles);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config,
+                            Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.workspace,
+            args.psum_num_recv_tokens_per_rank,
+            args.psum_num_recv_tokens_per_expert,
+            args.num_unaligned_recv_tokens_per_expert,
+            args.cumulative_local_expert_recv_stats,
+            args.destination_rank_idx,
+            args.generation));
+    }
+};
+
+static void launch_dispatch_rank_ready_prefix(
+    void* workspace,
+    int* psum_num_recv_tokens_per_rank,
+    int* psum_num_recv_tokens_per_expert,
+    int* num_unaligned_recv_tokens_per_expert,
+    int* cumulative_local_expert_recv_stats,
+    const int& destination_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const int& expert_alignment,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const DispatchRankReadyPrefixRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .expert_alignment = expert_alignment,
+        .num_timeout_cycles = num_timeout_cycles,
+        .workspace = workspace,
+        .psum_num_recv_tokens_per_rank = psum_num_recv_tokens_per_rank,
+        .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
+        .num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert,
+        .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,
+        .destination_rank_idx = destination_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0)};
+    const auto code = DispatchRankReadyPrefixRuntime::generate(args);
+    const auto runtime = jit::compiler->build("dispatch_rank_ready_prefix", code);
+    DispatchRankReadyPrefixRuntime::launch(runtime, args, stream);
+}
+
 class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopyEpilogueRuntime> {
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding;
+        bool wait_for_dispatch, do_expand, cached_mode, do_zero_padding;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -264,9 +443,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
+                           args.wait_for_dispatch,
                            args.do_expand, args.cached_mode, args.do_zero_padding,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -308,6 +488,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const bool& do_zero_padding,
+                                          const bool& wait_for_dispatch,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -316,6 +497,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
+        .wait_for_dispatch = wait_for_dispatch,
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,

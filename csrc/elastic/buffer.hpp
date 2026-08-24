@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -36,6 +37,19 @@ class ElasticBuffer {
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
+    at::cuda::CUDAStream streaming_copy_stream;
+    mutable std::optional<torch::Tensor> latest_streaming_packed_x;
+    mutable std::optional<torch::Tensor> latest_streaming_packed_sf;
+    mutable std::optional<torch::Tensor> latest_streaming_packed_topk_weights;
+    mutable std::optional<torch::Tensor> latest_streaming_packed_src_metadata;
+    mutable std::optional<EventHandle> streaming_consumer_event;
+    mutable uint64_t streaming_generation = 0;
+    mutable uint64_t latest_streaming_generation = 0;
+    mutable int latest_streaming_num_ranks = 0;
+    mutable int latest_streaming_num_local_experts = 0;
+    mutable int latest_streaming_lane_route_capacity = 0;
+    mutable bool streaming_copy_used = false;
+    mutable bool streaming_lane_view_outstanding = false;
 
     // Whether to use hybrid mode (scale-out with scale-up)
     bool allow_hybrid_mode;
@@ -91,6 +105,7 @@ public:
         num_cpu_buffer_bytes(num_cpu_buffer_bytes),
         explicitly_destroy(explicitly_destroy),
         comm_stream(get_global_comm_stream()),
+        streaming_copy_stream(at::cuda::getStreamFromPool(false)),
         allow_hybrid_mode(allow_hybrid_mode),
         allow_multiple_reduction(allow_multiple_reduction),
         prefer_overlap_with_compute(prefer_overlap_with_compute) {
@@ -151,6 +166,14 @@ public:
 
     void destroy() {
         EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(not streaming_lane_view_outstanding and
+                       "Call release_streaming_lane_view() before destroy()");
+
+        // The experimental copy consumer runs on a separate stream and may
+        // outlive the legacy dispatch return event. Drain it before freeing
+        // symmetric workspace or ingress buffers.
+        if (streaming_copy_used)
+            stream_wait(comm_stream, streaming_copy_stream);
 
         // Finish all works on all GPUs
         barrier(true, true);
@@ -167,6 +190,129 @@ public:
 
     torch::Stream get_comm_stream() const {
         return comm_stream;
+    }
+
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, torch::Tensor,
+               torch::Tensor, torch::Tensor, uint64_t>
+    get_streaming_lane_view() const {
+        EP_HOST_ASSERT(streaming_lane_view_outstanding and
+                       latest_streaming_packed_x.has_value() and
+                       latest_streaming_packed_src_metadata.has_value());
+        const auto num_ranks = latest_streaming_num_ranks;
+        const auto num_local_experts = latest_streaming_num_local_experts;
+        const auto lane_capacity = latest_streaming_lane_route_capacity;
+        const auto workspace_layout = layout::WorkspaceLayout(
+            workspace, 1, num_ranks, num_ranks * num_local_experts);
+        auto lane_psum_storage = torch::from_blob(
+            workspace_layout.get_streaming_lane_psum_ptr(0),
+            {num_ranks, 1 + layout::WorkspaceLayout::kNumMaxExpertsPerRank},
+            {1 + layout::WorkspaceLayout::kNumMaxExpertsPerRank, 1},
+            torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA));
+        auto pack_done_seq = torch::from_blob(
+            &workspace_layout.get_streaming_lane_control_ptr(0)->pack_done_seq,
+            {num_ranks},
+            {static_cast<int64_t>(sizeof(streaming::LaneControl) / sizeof(uint64_t))},
+            torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+        return {
+            latest_streaming_packed_x->view(
+                {num_ranks, lane_capacity, latest_streaming_packed_x->size(1)}),
+            latest_streaming_packed_sf,
+            latest_streaming_packed_topk_weights.has_value() ?
+                std::make_optional(latest_streaming_packed_topk_weights->view(
+                    {num_ranks, lane_capacity})) : std::nullopt,
+            latest_streaming_packed_src_metadata.value(),
+            lane_psum_storage.slice(1, 0, num_local_experts),
+            pack_done_seq,
+            latest_streaming_generation};
+    }
+
+    void release_streaming_lane_view() const {
+        EP_HOST_ASSERT(streaming_lane_view_outstanding);
+        streaming_consumer_event = EventHandle(at::cuda::getCurrentCUDAStream());
+        streaming_lane_view_outstanding = false;
+    }
+
+    void streaming_combine_return(
+        torch::Tensor lane_output,
+        torch::Tensor lane_src_metadata,
+        const int& source_rank_idx,
+        const uint64_t& generation) const {
+        EP_HOST_ASSERT(get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0 and
+                       "Streaming layer return is disabled");
+        EP_HOST_ASSERT(streaming_lane_view_outstanding and
+                       latest_streaming_packed_x.has_value());
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and
+                       nccl_context->is_scaleup_nvlink and
+                       "Streaming layer return requires one NVLink scale-up domain");
+        EP_HOST_ASSERT(generation == latest_streaming_generation);
+        EP_HOST_ASSERT(0 <= source_rank_idx and
+                       source_rank_idx < latest_streaming_num_ranks);
+        EP_HOST_ASSERT(lane_output.dim() == 2 and lane_output.is_cuda() and
+                       lane_output.is_contiguous() and
+                       lane_output.scalar_type() == torch::kBFloat16);
+        EP_HOST_ASSERT(lane_output.size(0) == latest_streaming_lane_route_capacity and
+                       lane_output.size(1) == latest_streaming_packed_x->size(1));
+        EP_HOST_ASSERT(lane_src_metadata.dim() == 2 and
+                       lane_src_metadata.is_cuda() and
+                       lane_src_metadata.is_contiguous() and
+                       lane_src_metadata.scalar_type() == torch::kInt);
+        const int num_topk = lane_src_metadata.size(1) - 2;
+        const int num_max_tokens_per_rank = lane_src_metadata.size(0);
+        EP_HOST_ASSERT(num_topk > 0 and num_max_tokens_per_rank > 0);
+
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        launch_streaming_combine_return(
+            lane_output.data_ptr(), lane_src_metadata.data_ptr<int>(),
+            source_rank_idx * latest_streaming_lane_route_capacity,
+            latest_streaming_lane_route_capacity,
+            nccl_context->dev_comm, nccl_context->window,
+            buffer, workspace,
+            source_rank_idx, nccl_context->scaleup_rank_idx,
+            generation,
+            latest_streaming_num_ranks, lane_output.size(1),
+            num_max_tokens_per_rank,
+            latest_streaming_num_ranks * latest_streaming_num_local_experts,
+            num_topk, nccl_context->num_allocated_qps,
+            stream);
+        lane_output.record_stream(stream);
+        lane_src_metadata.record_stream(stream);
+    }
+
+    std::tuple<torch::Tensor, EventHandle> streaming_combine_reduce(
+        torch::Tensor topk_idx,
+        const uint64_t& generation) const {
+        EP_HOST_ASSERT(get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0 and
+                       "Streaming layer reduce is disabled");
+        EP_HOST_ASSERT(streaming_lane_view_outstanding and
+                       latest_streaming_packed_x.has_value());
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and
+                       nccl_context->is_scaleup_nvlink);
+        EP_HOST_ASSERT(generation == latest_streaming_generation);
+        EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_cuda() and
+                       topk_idx.is_contiguous() and
+                       topk_idx.scalar_type() ==
+                           c10::CppTypeToScalarType<topk_idx_t>::value);
+        const int num_combined_tokens = topk_idx.size(0);
+        const int num_topk = topk_idx.size(1);
+        const int hidden = latest_streaming_packed_x->size(1);
+        const int num_max_tokens_per_rank =
+            latest_streaming_packed_src_metadata->size(0) /
+            latest_streaming_num_ranks;
+        auto combined_x = torch::empty(
+            {num_combined_tokens, hidden}, latest_streaming_packed_x->options());
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        launch_streaming_combine_reduce(
+            combined_x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
+            buffer, workspace,
+            num_combined_tokens, generation,
+            latest_streaming_num_ranks, hidden,
+            num_max_tokens_per_rank,
+            latest_streaming_num_ranks * latest_streaming_num_local_experts,
+            num_topk, stream);
+        topk_idx.record_stream(stream);
+        combined_x.record_stream(stream);
+        return {combined_x, EventHandle(stream)};
     }
 
     std::tuple<int, int> get_physical_domain_size() const {
@@ -553,14 +699,17 @@ public:
             stream_wait(comm_stream, previous_event_before_epilogue.value());
     }
 
-    std::optional<EventHandle> stream_control_epilogue(const std::vector<std::optional<torch::Tensor>>& tensors,
+    std::optional<EventHandle> stream_control_epilogue_on_stream(
+                                                       const std::vector<std::optional<torch::Tensor>>& tensors,
                                                        const at::cuda::CUDAStream& compute_stream,
+                                                       const at::cuda::CUDAStream& completion_stream,
+                                                       const bool& also_record_comm_stream,
                                                        const bool& allocate_on_comm_stream,
                                                        const bool& async_with_compute_stream) const {
         // Ensure memory access safety between two streams
         std::optional<EventHandle> event;
         if (async_with_compute_stream) {
-            event = EventHandle(comm_stream);
+            event = EventHandle(completion_stream);
 
             // NOTES: this environment only applies to V2 APIs
             if (get_env<int>("EP_AVOID_RECORD_STREAM", 0)) {
@@ -568,11 +717,13 @@ public:
             } else {
                 for (auto& t: tensors) if (t.has_value()) {
                     t->record_stream(compute_stream);
-                    t->record_stream(comm_stream);
+                    t->record_stream(completion_stream);
+                    if (also_record_comm_stream and comm_stream.id() != completion_stream.id())
+                        t->record_stream(comm_stream);
                 }
             }
         } else {
-            stream_wait(compute_stream, comm_stream);
+            stream_wait(compute_stream, completion_stream);
         }
 
         // Switch back compute stream
@@ -581,6 +732,15 @@ public:
 
         // The CUDA event marking the finishing
         return event;
+    }
+
+    std::optional<EventHandle> stream_control_epilogue(const std::vector<std::optional<torch::Tensor>>& tensors,
+                                                       const at::cuda::CUDAStream& compute_stream,
+                                                       const bool& allocate_on_comm_stream,
+                                                       const bool& async_with_compute_stream) const {
+        return stream_control_epilogue_on_stream(
+            tensors, compute_stream, comm_stream, false,
+            allocate_on_comm_stream, async_with_compute_stream);
     }
 
     static int64_t get_dispatch_buffer_size(const int& num_max_tokens_per_rank,
@@ -977,10 +1137,43 @@ public:
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
+        const bool export_streaming_lanes = get_env<int>("EP_EXPERIMENTAL_STREAMING_LANES") != 0;
+        const bool run_streaming_shadow = get_env<int>("EP_EXPERIMENTAL_STREAMING_COPY_SHADOW") != 0;
+        const bool run_rank_ready = get_env<int>("EP_EXPERIMENTAL_RANK_READY") != 0;
+        EP_HOST_ASSERT(static_cast<int>(export_streaming_lanes) +
+                       static_cast<int>(run_streaming_shadow) +
+                       static_cast<int>(run_rank_ready) <= 1);
+        const bool run_streaming_copy = export_streaming_lanes or run_streaming_shadow;
+        const bool emit_streaming_signals =
+            run_streaming_copy or run_rank_ready or
+            get_env<int>("EP_EXPERIMENTAL_STREAMING_SIGNALS") != 0;
+        EP_HOST_ASSERT(not emit_streaming_signals or
+                       (nccl_context->num_scaleout_ranks == 1 and
+                        nccl_context->is_scaleup_nvlink and not cached_mode));
+        EP_HOST_ASSERT(not run_streaming_copy or
+                       (do_expand and not do_cpu_sync and not do_zero_padding));
+        EP_HOST_ASSERT(not run_rank_ready or
+                       (do_expand and not do_cpu_sync and not do_zero_padding and
+                        not cached_mode and nccl_context->num_scaleout_ranks == 1));
+        EP_HOST_ASSERT(not run_rank_ready or get_env<int>("EP_AVOID_RECORD_STREAM", 0) == 0);
+        const uint64_t current_streaming_generation =
+            emit_streaming_signals ? ++ streaming_generation : 0;
+        if (run_streaming_copy or run_rank_ready) {
+            EP_HOST_ASSERT(not streaming_lane_view_outstanding and
+                           "Previous streaming lane view was not released");
+            if (streaming_consumer_event.has_value()) {
+                stream_wait(comm_stream, streaming_consumer_event.value());
+                streaming_consumer_event.reset();
+            }
+            // Prevent the next producer generation from reusing workspace or
+            // ingress slots while the previous shadow consumer is still live.
+            stream_wait(comm_stream, streaming_copy_stream);
+            streaming_copy_used = true;
+        }
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                         copied_topk_idx_ptr,
-                        cumulative_local_expert_recv_stats_ptr,
+                        run_rank_ready ? nullptr : cumulative_local_expert_recv_stats_ptr,
                         psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                         psum_num_recv_tokens_per_expert.data_ptr<int>(),
                         num_unaligned_recv_tokens_per_expert_ptr,
@@ -999,7 +1192,8 @@ public:
                         num_sms, num_channels_per_sm,
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
-                        cached_mode, do_cpu_sync,
+                        cached_mode, emit_streaming_signals,
+                        current_streaming_generation, do_cpu_sync,
                         comm_stream);
 
         // Received token counters
@@ -1110,8 +1304,111 @@ public:
             recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
         }
 
-        // Process prefix sum, in expanding mode, it is also atomic counters
-        if (not cached_mode) {
+        // M1C sidecar output uses DeepGEMM-compatible source-lane psum layout.
+        // EP_EXPERIMENTAL_STREAMING_LANES exports it to the grouped-GEMM
+        // consumer; the shadow-only mode retains it as a diagnostic.
+        auto streaming_packed_x = std::optional<torch::Tensor>();
+        auto streaming_packed_sf = std::optional<torch::Tensor>();
+        auto streaming_packed_topk_weights = std::optional<torch::Tensor>();
+        auto streaming_packed_src_metadata = std::optional<torch::Tensor>();
+        if (run_streaming_copy) {
+            const int64_t raw_lane_route_capacity =
+                static_cast<int64_t>(num_max_tokens_per_rank) * std::min(num_topk, num_local_experts);
+            const int64_t lane_route_capacity = raw_lane_route_capacity +
+                static_cast<int64_t>(num_local_experts - 1) *
+                    (streaming::kExpertAlignmentRows - 1);
+            const int64_t num_streaming_packed_tokens =
+                nccl_context->num_ranks * lane_route_capacity;
+            EP_HOST_ASSERT(
+                num_streaming_packed_tokens <= std::numeric_limits<int>::max());
+            streaming_packed_x = torch::empty(
+                {num_streaming_packed_tokens, hidden}, x.options());
+
+            int streaming_sf_token_stride = 0, streaming_sf_hidden_stride = 0;
+            if (sf.has_value()) {
+                if (not use_tma_aligned_col_major_sf) {
+                    streaming_sf_token_stride = num_sf_packs;
+                    streaming_sf_hidden_stride = 1;
+                } else {
+                    streaming_sf_token_stride = 1;
+                    streaming_sf_hidden_stride = math::align(
+                        static_cast<int>(num_streaming_packed_tokens), kNumAlignedSFPacks);
+                }
+                streaming_packed_sf = torch::empty_strided(
+                    {num_streaming_packed_tokens, num_sf_packs},
+                    {streaming_sf_token_stride, streaming_sf_hidden_stride},
+                    sf->options());
+            }
+            if (topk_weights.has_value()) {
+                streaming_packed_topk_weights = torch::empty(
+                    {num_streaming_packed_tokens}, topk_weights->options());
+            }
+            streaming_packed_src_metadata = torch::empty(
+                {static_cast<int64_t>(nccl_context->num_ranks) * num_max_tokens_per_rank,
+                 num_topk + 2},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+            launch_dispatch_streaming_copy(
+                buffer, workspace,
+                streaming_packed_x->mutable_data_ptr(),
+                streaming_packed_sf.has_value() ? streaming_packed_sf->mutable_data_ptr() : nullptr,
+                get_data_ptr<float>(streaming_packed_topk_weights),
+                streaming_packed_src_metadata->data_ptr<int>(),
+                streaming_sf_token_stride, streaming_sf_hidden_stride,
+                nccl_context->scaleup_rank_idx,
+                current_streaming_generation,
+                nccl_context->num_ranks,
+                num_hidden_bytes, num_sf_packs,
+                num_max_tokens_per_rank,
+                num_experts, num_topk,
+                jit::device_runtime->get_num_smem_bytes(),
+                num_gpu_timeout_cycles,
+                streaming_copy_stream);
+
+            // Record the producer stream so the allocator cannot recycle the
+            // storage while the copy grid is still active.
+            streaming_packed_x->record_stream(streaming_copy_stream);
+            if (streaming_packed_sf.has_value())
+                streaming_packed_sf->record_stream(streaming_copy_stream);
+            if (streaming_packed_topk_weights.has_value())
+                streaming_packed_topk_weights->record_stream(streaming_copy_stream);
+            streaming_packed_src_metadata->record_stream(streaming_copy_stream);
+
+            if (export_streaming_lanes) {
+                latest_streaming_packed_x = streaming_packed_x;
+                latest_streaming_packed_sf = streaming_packed_sf;
+                latest_streaming_packed_topk_weights = streaming_packed_topk_weights;
+                latest_streaming_packed_src_metadata = streaming_packed_src_metadata;
+                latest_streaming_generation = current_streaming_generation;
+                latest_streaming_num_ranks = nccl_context->num_ranks;
+                latest_streaming_num_local_experts = num_local_experts;
+                latest_streaming_lane_route_capacity = lane_route_capacity;
+                streaming_lane_view_outstanding = true;
+            }
+        }
+
+        // The rank-ready path owns separate counters: dispatch notify warps
+        // may still be blocked in the legacy all-rank count exchange while
+        // the destination-local prefix kernel consumes lane-local counts.
+        auto bulk_psum_num_recv_tokens_per_scaleup_rank = std::optional<torch::Tensor>();
+        auto bulk_psum_num_recv_tokens_per_expert = std::optional<torch::Tensor>();
+        auto bulk_num_unaligned_recv_tokens_per_expert = std::optional<torch::Tensor>();
+        if (run_rank_ready) {
+            bulk_psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank;
+            bulk_psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert;
+            bulk_num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert;
+            psum_num_recv_tokens_per_scaleup_rank = torch::empty(
+                {nccl_context->num_scaleup_ranks},
+                at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            psum_num_recv_tokens_per_expert = torch::empty(
+                {num_local_experts},
+                at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            num_unaligned_recv_tokens_per_expert = torch::empty(
+                {num_local_experts},
+                at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            num_unaligned_recv_tokens_per_expert_ptr =
+                num_unaligned_recv_tokens_per_expert.data_ptr<int>();
+        } else if (not cached_mode) {
             if (do_expand) {
                 // Slice the exclusive part and do atomic additions into inclusive
                 psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts);
@@ -1122,8 +1419,26 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Launch copy kernels with full SMs
-        stream_control_before_epilogue(previous_event_before_epilogue);
+        // Launch one ordinary merged copy as soon as this destination rank is
+        // complete. It consumes ingress directly; there is no lane shadow pack.
+        const auto completion_stream = run_rank_ready ? streaming_copy_stream : comm_stream;
+        if (previous_event_before_epilogue.has_value())
+            stream_wait(completion_stream, previous_event_before_epilogue.value());
+        if (run_rank_ready) {
+            launch_dispatch_rank_ready_prefix(
+                workspace,
+                psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                num_unaligned_recv_tokens_per_expert_ptr,
+                cumulative_local_expert_recv_stats_ptr,
+                nccl_context->scaleup_rank_idx,
+                current_streaming_generation,
+                nccl_context->num_ranks,
+                num_experts,
+                expert_alignment,
+                num_gpu_timeout_cycles,
+                completion_stream);
+        }
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
@@ -1143,10 +1458,11 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       do_zero_padding,
-                                      comm_stream);
+                                      not run_rank_ready,
+                                      completion_stream);
 
         // Stream control
-        const auto event = stream_control_epilogue(
+        const auto event = stream_control_epilogue_on_stream(
             {x, sf, topk_idx, topk_weights,
              recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
              cumulative_local_expert_recv_stats,
@@ -1157,8 +1473,13 @@ public:
              recv_src_metadata,
              dst_buffer_slot_idx,
              token_metadata_at_forward,
-             channel_linked_list},
+             channel_linked_list,
+             bulk_psum_num_recv_tokens_per_scaleup_rank,
+             bulk_psum_num_recv_tokens_per_expert,
+             bulk_num_unaligned_recv_tokens_per_expert},
             compute_stream,
+            completion_stream,
+            run_rank_ready,
             allocate_on_comm_stream, async_with_compute_stream);
 
         return {recv_x, recv_sf,
@@ -1282,6 +1603,13 @@ public:
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+        const bool bypass_combine_entry_barrier =
+            get_env<int>("EP_EXPERIMENTAL_ASYNC_COMBINE_ENTRY") != 0;
+        EP_HOST_ASSERT((not bypass_combine_entry_barrier or
+                        (get_env<int>("EP_EXPERIMENTAL_RANK_READY") != 0 and
+                         nccl_context->num_scaleout_ranks == 1 and
+                         nccl_context->is_scaleup_nvlink)) and
+                       "Asynchronous combine entry is inference-only and requires rank-ready dispatch in a single NVLink scale-up domain");
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
@@ -1300,6 +1628,7 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            bypass_combine_entry_barrier,
             comm_stream);
 
         // Allocate output tensors
@@ -1348,6 +1677,10 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
+        .def("get_streaming_lane_view", &ElasticBuffer::get_streaming_lane_view)
+        .def("release_streaming_lane_view", &ElasticBuffer::release_streaming_lane_view)
+        .def("streaming_combine_return", &ElasticBuffer::streaming_combine_return)
+        .def("streaming_combine_reduce", &ElasticBuffer::streaming_combine_reduce)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)
         .def("barrier", &ElasticBuffer::barrier)

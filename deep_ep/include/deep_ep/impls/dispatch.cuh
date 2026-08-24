@@ -17,6 +17,7 @@ namespace deep_ep::elastic {
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
+          bool kEmitStreamingSignals,
           int kNumSMs,
           int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks,
@@ -41,11 +42,13 @@ dispatch_impl(
     const int sf_token_stride, const int sf_hidden_stride,
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, void* buffer,
     void* workspace, void* mapped_host_workspace,
-    const int rank_idx
+    const int rank_idx, const uint64_t streaming_generation
 ) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
+    EP_STATIC_ASSERT(not kEmitStreamingSignals or kIsScaleupNVLink,
+                     "The first streaming producer milestone only supports NVLink scaleup");
 
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
@@ -62,7 +65,7 @@ dispatch_impl(
     EP_STATIC_ASSERT(kNumSmemBytesForNotify % ptx::kNumTMAAlignBytes == 0, "Invalid TMA alignment");
 
     // Named barrier indices
-    constexpr int kNotifyBarrierIndex = 1;
+    constexpr int kNotifyBarrierIndex = 1, kDispatchBarrierIndex = 2;
 
     // Gin handle
     // We treat each warp as a "channel"
@@ -70,10 +73,14 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Barrier without TMA store flush, without prologue grid sync
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    // The experimental producer path owns a generation-tagged lane and does
+    // not require all source ranks to enter dispatch together. The legacy
+    // barrier remains the default until the ready-lane copy path is wired.
+    if constexpr (not kEmitStreamingSignals) {
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
@@ -146,6 +153,37 @@ dispatch_impl(
                 });
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            // Publish counts in a source-local layout before waiting for any
+            // other rank. The payload doorbell is released later by the last
+            // dispatch block, after all data QPs have been flushed.
+            if constexpr (kEmitStreamingSignals) {
+                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+                    gin.put_value<team_t>(
+                        workspace_layout.get_streaming_lane_token_count_ptr(rank_idx),
+                        static_cast<int64_t>(math::encode_decode_positive(rank_count[i])), i,
+                        ncclGinOptFlagsAggregateRequests);
+                }
+                for (int i = thread_idx; i < kNumExperts; i += kNumNotifyThreads) {
+                    const int dst_rank_idx = i / kNumExpertsPerRank;
+                    const int local_expert_idx = i % kNumExpertsPerRank;
+                    gin.put_value<team_t>(
+                        workspace_layout.get_streaming_lane_expert_count_ptr(rank_idx, local_expert_idx),
+                        static_cast<int64_t>(math::encode_decode_positive(expert_count[i])), dst_rank_idx,
+                        ncclGinOptFlagsAggregateRequests);
+                }
+                // Scale-up put_value() resolves to direct LSA stores. Fence
+                // those stores instead of flushing a GIN queue, which may be
+                // deliberately disabled for a single-node communicator.
+                ptx::fence_acq_rel_sys();
+                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+                __syncwarp();
+                if (thread_idx == 0) {
+                    ptx::st_release_sys(
+                        &workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready,
+                        static_cast<uint32_t>(1));
+                }
+            }
 
             // TODO: for further optimization, we can fuse rank and expert counters
             // Issue scaleup rank count writes to peers
@@ -392,6 +430,60 @@ dispatch_impl(
                 __syncwarp();
             }
         }
+
+        if constexpr (kEmitStreamingSignals) {
+            // Each dispatch warp flushes the QP it used. A named barrier keeps
+            // this coordination independent from notify warps, which may be
+            // waiting for slow ranks in the legacy count path.
+            ptx::tma_store_commit();
+            ptx::tma_store_wait();
+            ptx::fence_acq_rel_sys();
+            ptx::named_barrier<kNumDispatchThreads>(kDispatchBarrierIndex);
+
+            bool is_last_block = false;
+            if (dispatch_warp_idx == 0 and lane_idx == 0) {
+                const auto old = atomicAdd(
+                    &workspace_layout.get_streaming_dispatch_sync_ptr()->completed_blocks,
+                    static_cast<uint32_t>(1));
+                is_last_block = old + 1 == kNumSMs;
+            }
+            if (dispatch_warp_idx == 0) {
+                is_last_block = __shfl_sync(0xffffffff, is_last_block, 0);
+                if (is_last_block) {
+                    if (lane_idx == 0) {
+                        comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                            const auto ready = ptx::ld_acquire_sys(
+                                &workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready);
+                            if (ready == 1)
+                                return true;
+                            if (is_last_check)
+                                printf("DeepEP streaming count publish timeout, rank: %d\n", rank_idx);
+                            return false;
+                        });
+                    }
+                    __syncwarp();
+
+                    for (int dst_rank_idx = lane_idx; dst_rank_idx < kNumRanks; dst_rank_idx += 32) {
+                        auto* remote_lane = workspace_layout.get_streaming_lane_control_ptr(rank_idx);
+                        auto* remote_seq = gin.get_sym_ptr<team_t>(
+                            &remote_lane->payload_done_seq, dst_rank_idx);
+                        EP_DEVICE_ASSERT(remote_seq != nullptr);
+                        auto* remote_control = gin.get_sym_ptr<team_t>(remote_lane, dst_rank_idx);
+                        EP_DEVICE_ASSERT(remote_control != nullptr);
+                        ptx::st_relaxed_sys(&remote_control->generation, streaming_generation);
+                        ptx::st_relaxed_sys(
+                            &remote_control->state,
+                            static_cast<uint32_t>(streaming::LaneState::kPayloadReady));
+                        ptx::st_release_sys(remote_seq, streaming_generation);
+                    }
+                    __syncwarp();
+                    if (lane_idx == 0) {
+                        workspace_layout.get_streaming_dispatch_sync_ptr()->completed_blocks = 0;
+                        workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready = 0;
+                    }
+                }
+            }
+        }
     }
 
     // Barrier to ensure data arrival
@@ -399,7 +491,9 @@ dispatch_impl(
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag1, true, true, false>(
         gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
 
-    // Trigger the copy epilogue kernel
+    // The legacy dependent epilogue still needs the bulk-completion trigger.
+    // The ready-lane shadow consumer is launched on an independent stream and
+    // does not depend on PDL admission.
     cudaTriggerProgrammaticLaunchCompletion();
 
     // Clean atomic counters

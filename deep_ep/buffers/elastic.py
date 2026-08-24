@@ -546,6 +546,34 @@ class ElasticBuffer:
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
+    def get_streaming_lane_view(self):
+        """Return lane-local tensors, psums, doorbells, and generation without a rank barrier."""
+        return self.runtime.get_streaming_lane_view()
+
+    def release_streaming_lane_view(self) -> None:
+        """Record current-stream consumption before dispatch reuses lane doorbells."""
+        self.runtime.release_streaming_lane_view()
+
+    def streaming_combine_return(
+        self,
+        lane_output: torch.Tensor,
+        lane_src_metadata: torch.Tensor,
+        source_rank: int,
+        generation: int,
+    ) -> None:
+        """Return one ready source lane without an all-rank combine barrier."""
+        self.runtime.streaming_combine_return(
+            lane_output, lane_src_metadata, source_rank, generation
+        )
+
+    def streaming_combine_reduce(
+        self,
+        topk_idx: torch.Tensor,
+        generation: int,
+    ) -> Tuple[torch.Tensor, EventHandle]:
+        """Reduce this source's returned rank slots and publish source done."""
+        return self.runtime.streaming_combine_reduce(topk_idx, generation)
+
     def get_physical_domain_size(self) -> Tuple[int, int]:
         """
         Get the physical domain sizes (RDMA ranks and NVLink ranks).

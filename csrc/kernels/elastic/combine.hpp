@@ -15,6 +15,7 @@ public:
     struct Args {
         // Templated arguments
         bool is_scaleup_nvlink;
+        bool bypass_entry_barrier;
         bool use_expanded_layout, allow_multiple_reduction;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -46,8 +47,9 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "combine";
-            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.is_scaleup_nvlink,
+                                    args.bypass_entry_barrier,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.launch_args.num_threads / 32,
@@ -58,6 +60,8 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
+            EP_HOST_ASSERT(not args.bypass_entry_barrier and
+                           "Asynchronous combine entry does not support hybrid mode");
             header_name = "hybrid_combine";
             func_name = fmt::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
@@ -129,6 +133,7 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const bool& bypass_entry_barrier,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -151,6 +156,7 @@ static void* launch_combine(void* x,
     const auto num_threads = num_warps * 32;
     const CombineRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
+        .bypass_entry_barrier = bypass_entry_barrier,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
@@ -284,6 +290,168 @@ static void launch_combine_reduce_epilogue(void* combined_x,
     const auto code = CombineReduceEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("combine_reduce_epilogue", code);
     CombineReduceEpilogueRuntime::launch(runtime, args, stream);
+}
+
+class StreamingCombineReturnRuntime final :
+    public jit::LaunchRuntime<StreamingCombineReturnRuntime> {
+public:
+    struct Args {
+        int num_warps, num_ranks, hidden, num_max_tokens_per_rank;
+        int num_experts, num_topk, num_qps;
+        nv_bfloat16* lane_output;
+        int* lane_src_metadata;
+        int lane_base_row, lane_capacity;
+        jit::NoRefPtr nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* buffer;
+        void* workspace;
+        int source_rank_idx, destination_rank_idx;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/combine_streaming.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}>);
+}}
+)",          args.num_warps, args.num_ranks, args.hidden,
+             args.num_max_tokens_per_rank, args.num_experts, args.num_topk,
+             args.num_qps);
+    }
+
+    static void launch_impl(
+        const jit::KernelHandle& kernel,
+        const jit::LaunchConfigHandle& config,
+        Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.lane_output, args.lane_src_metadata,
+            args.lane_base_row, args.lane_capacity,
+            args.nccl_dev_comm, args.nccl_window,
+            args.buffer, args.workspace,
+            args.source_rank_idx, args.destination_rank_idx,
+            args.generation));
+    }
+};
+
+static void launch_streaming_combine_return(
+    void* lane_output, int* lane_src_metadata,
+    const int& lane_base_row, const int& lane_capacity,
+    const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
+    void* buffer, void* workspace,
+    const int& source_rank_idx, const int& destination_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks, const int& hidden,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk, const int& num_qps,
+    const at::cuda::CUDAStream& stream) {
+    constexpr int kNumWarps = 4;
+    const auto token_layout = layout::TokenLayout(
+        hidden * sizeof(nv_bfloat16), 0, num_topk, false);
+    const auto num_smem_bytes =
+        kNumWarps * token_layout.get_num_bytes<true>();
+    const StreamingCombineReturnRuntime::Args args = {
+        .num_warps = kNumWarps,
+        .num_ranks = num_ranks,
+        .hidden = hidden,
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .num_experts = num_experts,
+        .num_topk = num_topk,
+        .num_qps = num_qps,
+        .lane_output = static_cast<nv_bfloat16*>(lane_output),
+        .lane_src_metadata = lane_src_metadata,
+        .lane_base_row = lane_base_row,
+        .lane_capacity = lane_capacity,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .buffer = buffer,
+        .workspace = workspace,
+        .source_rank_idx = source_rank_idx,
+        .destination_rank_idx = destination_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, kNumWarps * 32, num_smem_bytes),
+    };
+    const auto runtime = jit::compiler->build(
+        "streaming_combine_return", StreamingCombineReturnRuntime::generate(args));
+    StreamingCombineReturnRuntime::launch(runtime, args, stream);
+}
+
+class StreamingCombineReduceRuntime final :
+    public jit::LaunchRuntime<StreamingCombineReduceRuntime> {
+public:
+    struct Args {
+        int num_warps, num_ranks, hidden, num_max_tokens_per_rank;
+        int num_experts, num_topk;
+        nv_bfloat16* combined_x;
+        topk_idx_t* combined_topk_idx;
+        void* buffer;
+        void* workspace;
+        int num_combined_tokens;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/combine_streaming.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_reduce_impl<{}, {}, {}, {}, {}, {}>);
+}}
+)",          args.num_warps, args.num_ranks, args.hidden,
+             args.num_max_tokens_per_rank, args.num_experts, args.num_topk);
+    }
+
+    static void launch_impl(
+        const jit::KernelHandle& kernel,
+        const jit::LaunchConfigHandle& config,
+        Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.combined_x, args.combined_topk_idx,
+            args.buffer, args.workspace,
+            args.num_combined_tokens, args.generation));
+    }
+};
+
+static void launch_streaming_combine_reduce(
+    void* combined_x, topk_idx_t* combined_topk_idx,
+    void* buffer, void* workspace,
+    const int& num_combined_tokens, const uint64_t& generation,
+    const int& num_ranks, const int& hidden,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts, const int& num_topk,
+    const at::cuda::CUDAStream& stream) {
+    constexpr int kNumWarps = 4;
+    const auto output_layout = layout::TokenLayout(
+        hidden * sizeof(nv_bfloat16), 0, 0, false);
+    const auto num_smem_bytes =
+        kNumWarps * output_layout.get_num_bytes<false>();
+    const StreamingCombineReduceRuntime::Args args = {
+        .num_warps = kNumWarps,
+        .num_ranks = num_ranks,
+        .hidden = hidden,
+        .num_max_tokens_per_rank = num_max_tokens_per_rank,
+        .num_experts = num_experts,
+        .num_topk = num_topk,
+        .combined_x = static_cast<nv_bfloat16*>(combined_x),
+        .combined_topk_idx = combined_topk_idx,
+        .buffer = buffer,
+        .workspace = workspace,
+        .num_combined_tokens = num_combined_tokens,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, kNumWarps * 32, num_smem_bytes),
+    };
+    const auto runtime = jit::compiler->build(
+        "streaming_combine_reduce", StreamingCombineReduceRuntime::generate(args));
+    StreamingCombineReduceRuntime::launch(runtime, args, stream);
 }
 
 }  // namespace deep_ep::elastic

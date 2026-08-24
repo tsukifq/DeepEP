@@ -12,7 +12,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kIsScaleupNVLink,
+template <bool kIsScaleupNVLink, bool kBypassEntryBarrier,
           bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs, int kNumWarps,
           int kNumRanks,
@@ -73,11 +73,18 @@ combine_impl(nv_bfloat16* x,
     const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumWarps>(sm_idx, warp_idx);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Full barrier to ensure the remote buffer is available
+    // The inference-only asynchronous entry path relies on persistent
+    // symmetric buffers and the previous combine's tag-1 barrier to prevent
+    // cross-generation reuse. It lets a ready rank start publishing before
+    // every peer has entered this combine. The final tag-1 barrier remains.
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
-    comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
-        gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    EP_STATIC_ASSERT(not kBypassEntryBarrier or kIsScaleupNVLink,
+                     "Asynchronous combine entry only supports NVLink scale-up");
+    if constexpr (not kBypassEntryBarrier) {
+        comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kCombineTag0, false, false, true>(
+            gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
+    }
 
     // Do TMA writes into the remote buffers
     int num_tokens_per_warp = math::ceil_div(num_reduced_tokens, kNumSMs * kNumWarps);

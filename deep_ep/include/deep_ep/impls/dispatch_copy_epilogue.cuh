@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kWaitForDispatch, bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -57,7 +57,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
     // Will block until the main dispatch kernel has finished and all data are visible
     // NOTES: PDL is used, please do not use `__ldg`
-    cudaGridDependencySynchronize();
+    if constexpr (kWaitForDispatch)
+        cudaGridDependencySynchronize();
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
