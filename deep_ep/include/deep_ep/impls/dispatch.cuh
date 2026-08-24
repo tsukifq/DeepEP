@@ -14,6 +14,51 @@
 
 namespace deep_ep::elastic {
 
+// Publish source-local completion from a separate kernel queued after the
+// dispatch grid.  The stream dependency is the grid-wide join: every payload
+// TMA store and count write from this source is complete before any remote
+// doorbell can become visible.  This avoids both the global rank barrier and
+// the unsafe "last CTA" approximation of grid completion.
+template <int kNumRanks, int kNumExperts, int kNumThreads = 32>
+__global__ void __launch_bounds__(kNumThreads, 1)
+dispatch_streaming_publish_impl(const ncclDevComm_t nccl_dev_comm,
+                                const ncclWindow_t nccl_window,
+                                void* workspace,
+                                const int source_rank_idx,
+                                const uint64_t generation) {
+    EP_STATIC_ASSERT(kNumRanks <= kNumThreads,
+                     "Streaming publish supports at most one warp of ranks");
+    EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0,
+                     "Invalid expert/rank shape");
+
+    const auto lane_idx = ptx::get_lane_idx();
+    const auto workspace_layout = layout::WorkspaceLayout(
+        workspace, 1, kNumRanks, kNumExperts);
+    const auto gin = handle::NCCLGin(
+        nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+
+    if (lane_idx < kNumRanks)
+        workspace_layout.get_scaleup_atomic_sender_counter()[lane_idx] = 0;
+    __syncwarp();
+
+    // The kernel boundary supplies the grid-wide dependency.  The system
+    // fence orders those completed peer writes before the release doorbell.
+    ptx::fence_acq_rel_sys();
+    __syncwarp();
+    if (lane_idx < kNumRanks) {
+        auto* local_lane =
+            workspace_layout.get_streaming_lane_control_ptr(source_rank_idx);
+        auto* remote_lane = gin.get_sym_ptr<ncclTeamTagLsa>(
+            local_lane, lane_idx);
+        EP_DEVICE_ASSERT(remote_lane != nullptr);
+        ptx::st_relaxed_sys(&remote_lane->generation, generation);
+        ptx::st_relaxed_sys(
+            &remote_lane->state,
+            static_cast<uint32_t>(streaming::LaneState::kPayloadReady));
+        ptx::st_release_sys(&remote_lane->payload_done_seq, generation);
+    }
+}
+
 template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
@@ -155,8 +200,8 @@ dispatch_impl(
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
 
             // Publish counts in a source-local layout before waiting for any
-            // other rank. The payload doorbell is released later by the last
-            // dispatch block, after all data QPs have been flushed.
+            // other rank. The follow-up publish kernel releases the payload
+            // doorbell only after this entire dispatch grid has completed.
             if constexpr (kEmitStreamingSignals) {
                 for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
                     gin.put_value<team_t>(
@@ -176,13 +221,6 @@ dispatch_impl(
                 // those stores instead of flushing a GIN queue, which may be
                 // deliberately disabled for a single-node communicator.
                 ptx::fence_acq_rel_sys();
-                ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
-                __syncwarp();
-                if (thread_idx == 0) {
-                    ptx::st_release_sys(
-                        &workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready,
-                        static_cast<uint32_t>(1));
-                }
             }
 
             // Streaming consumers use the source-local counts above and never
@@ -439,65 +477,13 @@ dispatch_impl(
         }
 
         if constexpr (kEmitStreamingSignals) {
-            // Each dispatch warp flushes the QP it used. A named barrier keeps
-            // this coordination within the dispatch-warp role after notify
-            // warps publish the source-local counts and retire.
+            // Drain every async store issued by this thread before the grid
+            // exits.  A follow-up kernel on the same stream performs the
+            // grid-wide join and publishes the remote source doorbells.
             ptx::tma_store_commit();
             ptx::tma_store_wait();
             ptx::fence_acq_rel_sys();
             ptx::named_barrier<kNumDispatchThreads>(kDispatchBarrierIndex);
-
-            bool is_last_block = false;
-            if (dispatch_warp_idx == 0 and lane_idx == 0) {
-                const auto old = atomicAdd(
-                    &workspace_layout.get_streaming_dispatch_sync_ptr()->completed_blocks,
-                    static_cast<uint32_t>(1));
-                is_last_block = old + 1 == kNumSMs;
-            }
-            if (dispatch_warp_idx == 0) {
-                is_last_block = __shfl_sync(0xffffffff, is_last_block, 0);
-                if (is_last_block) {
-                    if (lane_idx == 0) {
-                        comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                            const auto ready = ptx::ld_acquire_sys(
-                                &workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready);
-                            if (ready == 1)
-                                return true;
-                            if (is_last_check)
-                                printf("DeepEP streaming count publish timeout, rank: %d\n", rank_idx);
-                            return false;
-                        });
-                    }
-                    __syncwarp();
-
-                    for (int dst_rank_idx = lane_idx; dst_rank_idx < kNumRanks; dst_rank_idx += 32) {
-                        auto* remote_lane = workspace_layout.get_streaming_lane_control_ptr(rank_idx);
-                        auto* remote_seq = gin.get_sym_ptr<team_t>(
-                            &remote_lane->payload_done_seq, dst_rank_idx);
-                        EP_DEVICE_ASSERT(remote_seq != nullptr);
-                        auto* remote_control = gin.get_sym_ptr<team_t>(remote_lane, dst_rank_idx);
-                        EP_DEVICE_ASSERT(remote_control != nullptr);
-                        ptx::st_relaxed_sys(&remote_control->generation, streaming_generation);
-                        ptx::st_relaxed_sys(
-                            &remote_control->state,
-                            static_cast<uint32_t>(streaming::LaneState::kPayloadReady));
-                        ptx::st_release_sys(remote_seq, streaming_generation);
-                    }
-                    __syncwarp();
-                    if constexpr (not kReuseSlotIndices) {
-                        for (int dst_rank_idx = lane_idx;
-                             dst_rank_idx < kNumRanks;
-                             dst_rank_idx += 32) {
-                            workspace_layout.get_scaleup_atomic_sender_counter()[dst_rank_idx] = 0;
-                        }
-                    }
-                    __syncwarp();
-                    if (lane_idx == 0) {
-                        workspace_layout.get_streaming_dispatch_sync_ptr()->completed_blocks = 0;
-                        workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready = 0;
-                    }
-                }
-            }
         }
     }
 

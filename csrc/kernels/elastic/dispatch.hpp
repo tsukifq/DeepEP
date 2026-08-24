@@ -131,6 +131,65 @@ static void __instantiate_kernel() {{
     }
 };
 
+class DispatchStreamingPublishRuntime final
+    : public jit::LaunchRuntime<DispatchStreamingPublishRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts;
+        jit::NoRefPtr nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int source_rank_idx;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_streaming_publish_impl<{}, {}>);
+}}
+)", args.num_ranks, args.num_experts);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config,
+                            Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window, args.workspace,
+            args.source_rank_idx, args.generation));
+    }
+};
+
+static void launch_dispatch_streaming_publish(
+    const jit::NoRefPtr& nccl_dev_comm,
+    const ncclWindow_t& nccl_window,
+    void* workspace,
+    const int& source_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const at::cuda::CUDAStream& stream) {
+    const DispatchStreamingPublishRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .source_rank_idx = source_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0)};
+    const auto code = DispatchStreamingPublishRuntime::generate(args);
+    const auto runtime = jit::compiler->build(
+        "dispatch_streaming_publish", code);
+    DispatchStreamingPublishRuntime::launch(runtime, args, stream);
+}
+
 constexpr int kNumNotifyWarps = 4;
 
 static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_experts) {
@@ -235,6 +294,14 @@ static void launch_dispatch(void* x, void* sf,
     const auto code = DispatchRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch", code);
     DispatchRuntime::launch(runtime, args, stream);
+    if (emit_streaming_signals) {
+        EP_HOST_ASSERT(num_scaleout_ranks == 1 and is_scaleup_nvlink and
+                       not cached_mode);
+        launch_dispatch_streaming_publish(
+            nccl_dev_comm, nccl_window, workspace,
+            scaleup_rank_idx, streaming_generation,
+            num_scaleup_ranks, num_experts, stream);
+    }
 }
 
 class DispatchStreamingCopyRuntime final : public jit::LaunchRuntime<DispatchStreamingCopyRuntime> {
