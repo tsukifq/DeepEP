@@ -48,6 +48,7 @@ class ElasticBuffer {
     mutable int latest_streaming_num_ranks = 0;
     mutable int latest_streaming_num_local_experts = 0;
     mutable int latest_streaming_lane_route_capacity = 0;
+    mutable void* latest_streaming_return_buffer = nullptr;
     mutable bool streaming_copy_used = false;
     mutable bool streaming_lane_view_outstanding = false;
 
@@ -239,6 +240,13 @@ public:
 
     void release_streaming_lane_view() const {
         EP_HOST_ASSERT(streaming_lane_view_outstanding);
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        launch_dispatch_streaming_ack(
+            nccl_context->dev_comm, nccl_context->window, workspace,
+            nccl_context->scaleup_rank_idx, latest_streaming_generation,
+            latest_streaming_num_ranks,
+            latest_streaming_num_ranks * latest_streaming_num_local_experts,
+            stream);
         streaming_consumer_event = EventHandle(at::cuda::getCurrentCUDAStream());
         streaming_lane_view_outstanding = false;
     }
@@ -256,6 +264,7 @@ public:
                        nccl_context->is_scaleup_nvlink and
                        "Streaming layer return requires one NVLink scale-up domain");
         EP_HOST_ASSERT(generation == latest_streaming_generation);
+        EP_HOST_ASSERT(latest_streaming_return_buffer != nullptr);
         EP_HOST_ASSERT(0 <= source_rank_idx and
                        source_rank_idx < latest_streaming_num_ranks);
         EP_HOST_ASSERT(lane_output.dim() == 2 and lane_output.is_cuda() and
@@ -277,13 +286,14 @@ public:
             source_rank_idx * latest_streaming_lane_route_capacity,
             latest_streaming_lane_route_capacity,
             nccl_context->dev_comm, nccl_context->window,
-            buffer, workspace,
+            latest_streaming_return_buffer, workspace,
             source_rank_idx, nccl_context->scaleup_rank_idx,
             generation,
             latest_streaming_num_ranks, lane_output.size(1),
             num_max_tokens_per_rank,
             latest_streaming_num_ranks * latest_streaming_num_local_experts,
             num_topk, nccl_context->num_allocated_qps,
+            num_gpu_timeout_cycles,
             stream);
         lane_output.record_stream(stream);
         lane_src_metadata.record_stream(stream);
@@ -299,6 +309,7 @@ public:
         EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and
                        nccl_context->is_scaleup_nvlink);
         EP_HOST_ASSERT(generation == latest_streaming_generation);
+        EP_HOST_ASSERT(latest_streaming_return_buffer != nullptr);
         EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_cuda() and
                        topk_idx.is_contiguous() and
                        topk_idx.scalar_type() ==
@@ -317,7 +328,9 @@ public:
         const auto stream = at::cuda::getCurrentCUDAStream();
         launch_streaming_combine_reduce(
             combined_x.data_ptr(), topk_idx.data_ptr<topk_idx_t>(),
-            buffer, workspace,
+            nccl_context->dev_comm, nccl_context->window,
+            latest_streaming_return_buffer, workspace,
+            nccl_context->scaleup_rank_idx,
             num_combined_tokens, generation,
             latest_streaming_num_ranks, hidden,
             num_max_tokens_per_rank,
@@ -854,8 +867,19 @@ public:
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink, allow_multiple_reduction);
 
-        // Return the maximum of those layouts, aligned to 2 MB
-        return math::align(std::max(num_dispatch_bytes, num_combine_bytes), symmetric::kNumAlignmentBytes);
+        // The regular path serializes dispatch and combine and can overlay the
+        // same region.  Streaming layers overlap them, so reserve disjoint
+        // symmetric regions with an aligned boundary between the layouts.
+        if (get_env<int>("EP_EXPERIMENTAL_STREAMING_LANES") != 0 and
+            get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0) {
+            return math::align(
+                math::align(num_dispatch_bytes, symmetric::kNumAlignmentBytes) +
+                    num_combine_bytes,
+                symmetric::kNumAlignmentBytes);
+        }
+        return math::align(
+            std::max(num_dispatch_bytes, num_combine_bytes),
+            symmetric::kNumAlignmentBytes);
     }
 
     static symmetric::cpu_handle_t create_cpu_handle(const int64_t& num_cpu_bytes) {
@@ -1171,6 +1195,29 @@ public:
         EP_HOST_ASSERT(not run_rank_ready or get_env<int>("EP_AVOID_RECORD_STREAM", 0) == 0);
         const uint64_t current_streaming_generation =
             emit_streaming_signals ? ++ streaming_generation : 0;
+        if (export_streaming_lanes and
+            get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0) {
+            const auto dispatch_region_bytes = math::align(
+                get_dispatch_buffer_size(
+                    num_max_tokens_per_rank, hidden, num_sf_packs, num_topk,
+                    x.element_size(), nccl_context->num_scaleout_ranks,
+                    nccl_context->num_scaleup_ranks,
+                    nccl_context->is_scaleup_nvlink),
+                symmetric::kNumAlignmentBytes);
+            const auto return_region_bytes = get_combine_buffer_size(
+                num_max_tokens_per_rank, hidden, num_topk,
+                nccl_context->num_scaleout_ranks,
+                nccl_context->num_scaleup_ranks,
+                nccl_context->is_scaleup_nvlink,
+                allow_multiple_reduction);
+            EP_HOST_ASSERT(dispatch_region_bytes + return_region_bytes <=
+                           num_gpu_buffer_bytes and
+                           "Streaming dispatch and combine require disjoint symmetric regions");
+            latest_streaming_return_buffer =
+                math::advance_ptr(buffer, dispatch_region_bytes);
+        } else {
+            latest_streaming_return_buffer = nullptr;
+        }
         if (run_streaming_copy or run_rank_ready) {
             EP_HOST_ASSERT(not streaming_lane_view_outstanding and
                            "Previous streaming lane view was not released");
@@ -1182,6 +1229,13 @@ public:
             // ingress slots while the previous shadow consumer is still live.
             stream_wait(comm_stream, streaming_copy_stream);
             streaming_copy_used = true;
+        }
+        if (export_streaming_lanes and current_streaming_generation > 1) {
+            launch_dispatch_streaming_reuse_wait(
+                workspace, nccl_context->scaleup_rank_idx,
+                current_streaming_generation - 1,
+                nccl_context->num_ranks, num_experts,
+                num_gpu_timeout_cycles, comm_stream);
         }
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,

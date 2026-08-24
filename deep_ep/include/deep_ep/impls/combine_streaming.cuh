@@ -20,7 +20,7 @@ template <int kNumWarps,
           int kHidden,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
-          int kNumQPs,
+          int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16)>
 __global__ void __launch_bounds__(kNumThreads, 1)
@@ -59,6 +59,26 @@ combine_streaming_return_impl(
     EP_DEVICE_ASSERT(0 <= num_source_tokens and
                      num_source_tokens <= kNumMaxTokensPerRank);
     EP_DEVICE_ASSERT(num_source_routes >= 0);
+
+    // The return buffer is single-slot per (source, destination).  Wait only
+    // for this source's previous reduction acknowledgement before reusing it.
+    if (thread_idx == 0 and generation > 1) {
+        const auto* ack_control =
+            workspace_layout.get_streaming_return_control_ptr(source_rank_idx);
+        comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+            if (streaming::acquire_return_ack(ack_control, generation - 1))
+                return true;
+            if (is_last_check) {
+                printf("DeepEP streaming return reuse timeout, dst: %d, src: %d, expected generation: %llu, observed: %llu\n",
+                       destination_rank_idx, source_rank_idx,
+                       static_cast<unsigned long long>(generation - 1),
+                       static_cast<unsigned long long>(
+                           ptx::ld_acquire_sys(&ack_control->ack_seq)));
+            }
+            return false;
+        });
+    }
+    __syncthreads();
 
     const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
     if (ptx::elect_one_sync())
@@ -150,7 +170,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 combine_streaming_reduce_impl(
     nv_bfloat16* combined_x,
     topk_idx_t* combined_topk_idx,
+    const ncclDevComm_t nccl_dev_comm,
+    const ncclWindow_t nccl_window,
     void* buffer, void* workspace,
+    const int source_rank_idx,
     const int num_combined_tokens,
     const uint64_t generation) {
     EP_STATIC_ASSERT(kNumRanks <= kNumTopk, "Streaming reduce requires rank layout");
@@ -158,6 +181,7 @@ combine_streaming_reduce_impl(
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
     EP_DEVICE_ASSERT(blockIdx.x == 0);
+    EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);
 
     const auto workspace_layout = layout::WorkspaceLayout(
         workspace, 1, kNumRanks, kNumExperts);
@@ -233,11 +257,25 @@ combine_streaming_reduce_impl(
             auto* control =
                 workspace_layout.get_streaming_return_control_ptr(destination);
             streaming::publish_combine_done(control, generation);
-            streaming::publish_return_ack(control, generation);
         }
         auto* layer_control = workspace_layout.get_streaming_layer_control_ptr();
         streaming::publish_source_done(layer_control, generation);
         ptx::st_release_sys(&layer_control->drain_done_seq, generation);
+    }
+    __syncthreads();
+
+    // Let each destination independently reuse the return slot that it owns
+    // for this source.  The reduction above has consumed every returned row.
+    if (thread_idx < kNumRanks) {
+        const auto gin = handle::NCCLGin(
+            nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+        auto* local_ack =
+            workspace_layout.get_streaming_return_control_ptr(source_rank_idx);
+        auto* remote_ack = gin.get_sym_ptr<ncclTeamTagLsa>(
+            local_ack, thread_idx);
+        EP_DEVICE_ASSERT(remote_ack != nullptr);
+        ptx::fence_acq_rel_sys();
+        ptx::st_release_sys(&remote_ack->ack_seq, generation);
     }
 }
 

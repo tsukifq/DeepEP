@@ -298,6 +298,7 @@ public:
     struct Args {
         int num_warps, num_ranks, hidden, num_max_tokens_per_rank;
         int num_experts, num_topk, num_qps;
+        int64_t num_timeout_cycles;
         nv_bfloat16* lane_output;
         int* lane_src_metadata;
         int lane_base_row, lane_capacity;
@@ -317,11 +318,11 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",          args.num_warps, args.num_ranks, args.hidden,
              args.num_max_tokens_per_rank, args.num_experts, args.num_topk,
-             args.num_qps);
+             args.num_qps, args.num_timeout_cycles);
     }
 
     static void launch_impl(
@@ -349,6 +350,7 @@ static void launch_streaming_combine_return(
     const int& num_ranks, const int& hidden,
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk, const int& num_qps,
+    const int64_t& num_timeout_cycles,
     const at::cuda::CUDAStream& stream) {
     constexpr int kNumWarps = 4;
     const auto token_layout = layout::TokenLayout(
@@ -363,6 +365,7 @@ static void launch_streaming_combine_return(
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps,
+        .num_timeout_cycles = num_timeout_cycles,
         .lane_output = static_cast<nv_bfloat16*>(lane_output),
         .lane_src_metadata = lane_src_metadata,
         .lane_base_row = lane_base_row,
@@ -389,8 +392,11 @@ public:
         int num_experts, num_topk;
         nv_bfloat16* combined_x;
         topk_idx_t* combined_topk_idx;
+        jit::NoRefPtr nccl_dev_comm;
+        ncclWindow_t nccl_window;
         void* buffer;
         void* workspace;
+        int source_rank_idx;
         int num_combined_tokens;
         uint64_t generation;
         jit::LaunchArgs launch_args;
@@ -416,14 +422,18 @@ static void __instantiate_kernel() {{
         EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
             kernel, config,
             args.combined_x, args.combined_topk_idx,
+            args.nccl_dev_comm, args.nccl_window,
             args.buffer, args.workspace,
+            args.source_rank_idx,
             args.num_combined_tokens, args.generation));
     }
 };
 
 static void launch_streaming_combine_reduce(
     void* combined_x, topk_idx_t* combined_topk_idx,
+    const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
     void* buffer, void* workspace,
+    const int& source_rank_idx,
     const int& num_combined_tokens, const uint64_t& generation,
     const int& num_ranks, const int& hidden,
     const int& num_max_tokens_per_rank,
@@ -443,8 +453,11 @@ static void launch_streaming_combine_reduce(
         .num_topk = num_topk,
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_idx = combined_topk_idx,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
         .buffer = buffer,
         .workspace = workspace,
+        .source_rank_idx = source_rank_idx,
         .num_combined_tokens = num_combined_tokens,
         .generation = generation,
         .launch_args = jit::LaunchArgs(1, kNumWarps * 32, num_smem_bytes),

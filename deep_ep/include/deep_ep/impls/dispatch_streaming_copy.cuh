@@ -213,6 +213,15 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
     __syncthreads();
     if (thread_idx == 0) {
         for (int expert_idx = 0; expert_idx < kNumExpertsPerRank; ++ expert_idx) {
+            if (lane_expert_cursor[expert_idx] !=
+                workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx]) {
+                printf("DeepEP streaming pack count mismatch, dst: %d, src: %d, generation: %llu, expert: %d, actual end: %d, expected end: %d, tokens: %d, routes: %d\n",
+                       destination_rank_idx, source_rank_idx,
+                       static_cast<unsigned long long>(generation), expert_idx,
+                       lane_expert_cursor[expert_idx],
+                       workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx],
+                       lane_num_tokens, lane_num_routes);
+            }
             EP_DEVICE_ASSERT(
                 lane_expert_cursor[expert_idx] ==
                 workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx]);

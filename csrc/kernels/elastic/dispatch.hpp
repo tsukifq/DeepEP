@@ -190,6 +190,120 @@ static void launch_dispatch_streaming_publish(
     DispatchStreamingPublishRuntime::launch(runtime, args, stream);
 }
 
+class DispatchStreamingAckRuntime final
+    : public jit::LaunchRuntime<DispatchStreamingAckRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts;
+        jit::NoRefPtr nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int destination_rank_idx;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_streaming_reuse.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_streaming_ack_impl<{}, {}>);
+}}
+)", args.num_ranks, args.num_experts);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config,
+                            Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window, args.workspace,
+            args.destination_rank_idx, args.generation));
+    }
+};
+
+static void launch_dispatch_streaming_ack(
+    const jit::NoRefPtr& nccl_dev_comm,
+    const ncclWindow_t& nccl_window,
+    void* workspace,
+    const int& destination_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const at::cuda::CUDAStream& stream) {
+    const DispatchStreamingAckRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .destination_rank_idx = destination_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0)};
+    const auto runtime = jit::compiler->build(
+        "dispatch_streaming_ack",
+        DispatchStreamingAckRuntime::generate(args));
+    DispatchStreamingAckRuntime::launch(runtime, args, stream);
+}
+
+class DispatchStreamingReuseWaitRuntime final
+    : public jit::LaunchRuntime<DispatchStreamingReuseWaitRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts;
+        int64_t num_timeout_cycles;
+        void* workspace;
+        int source_rank_idx;
+        uint64_t previous_generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_streaming_reuse.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_streaming_reuse_wait_impl<{}, {}, {}>);
+}}
+)", args.num_ranks, args.num_experts, args.num_timeout_cycles);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config,
+                            Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config, args.workspace,
+            args.source_rank_idx, args.previous_generation));
+    }
+};
+
+static void launch_dispatch_streaming_reuse_wait(
+    void* workspace,
+    const int& source_rank_idx,
+    const uint64_t& previous_generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const DispatchStreamingReuseWaitRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .num_timeout_cycles = num_timeout_cycles,
+        .workspace = workspace,
+        .source_rank_idx = source_rank_idx,
+        .previous_generation = previous_generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0)};
+    const auto runtime = jit::compiler->build(
+        "dispatch_streaming_reuse_wait",
+        DispatchStreamingReuseWaitRuntime::generate(args));
+    DispatchStreamingReuseWaitRuntime::launch(runtime, args, stream);
+}
+
 constexpr int kNumNotifyWarps = 4;
 
 static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_experts) {
