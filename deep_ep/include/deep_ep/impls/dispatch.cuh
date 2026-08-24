@@ -185,6 +185,13 @@ dispatch_impl(
                 }
             }
 
+            // Streaming consumers use the source-local counts above and never
+            // consume the legacy rank/expert prefix. Returning the notify
+            // warps here removes their all-rank count wait from this dispatch
+            // generation without changing the default kernel specialization.
+            if constexpr (kEmitStreamingSignals)
+                return;
+
             // TODO: for further optimization, we can fuse rank and expert counters
             // Issue scaleup rank count writes to peers
             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
@@ -433,8 +440,8 @@ dispatch_impl(
 
         if constexpr (kEmitStreamingSignals) {
             // Each dispatch warp flushes the QP it used. A named barrier keeps
-            // this coordination independent from notify warps, which may be
-            // waiting for slow ranks in the legacy count path.
+            // this coordination within the dispatch-warp role after notify
+            // warps publish the source-local counts and retire.
             ptx::tma_store_commit();
             ptx::tma_store_wait();
             ptx::fence_acq_rel_sys();
@@ -477,6 +484,14 @@ dispatch_impl(
                         ptx::st_release_sys(remote_seq, streaming_generation);
                     }
                     __syncwarp();
+                    if constexpr (not kReuseSlotIndices) {
+                        for (int dst_rank_idx = lane_idx;
+                             dst_rank_idx < kNumRanks;
+                             dst_rank_idx += 32) {
+                            workspace_layout.get_scaleup_atomic_sender_counter()[dst_rank_idx] = 0;
+                        }
+                    }
+                    __syncwarp();
                     if (lane_idx == 0) {
                         workspace_layout.get_streaming_dispatch_sync_ptr()->completed_blocks = 0;
                         workspace_layout.get_streaming_dispatch_sync_ptr()->counts_ready = 0;
@@ -485,6 +500,12 @@ dispatch_impl(
             }
         }
     }
+
+    // Every local payload store and source-lane release is complete at this
+    // point. Streaming consumers own generation-tagged lifetime tracking, so
+    // they do not need the legacy all-rank completion barrier or PDL trigger.
+    if constexpr (kEmitStreamingSignals)
+        return;
 
     // Barrier to ensure data arrival
     comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,

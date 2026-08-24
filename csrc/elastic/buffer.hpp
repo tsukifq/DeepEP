@@ -1419,47 +1419,50 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Launch one ordinary merged copy as soon as this destination rank is
-        // complete. It consumes ingress directly; there is no lane shadow pack.
+        // Legacy and rank-ready modes still materialize the ordinary merged
+        // receive layout. The exported lane path consumes its independently
+        // released sidecar and must not queue this unused bulk epilogue.
         const auto completion_stream = run_rank_ready ? streaming_copy_stream : comm_stream;
-        if (previous_event_before_epilogue.has_value())
-            stream_wait(completion_stream, previous_event_before_epilogue.value());
-        if (run_rank_ready) {
-            launch_dispatch_rank_ready_prefix(
-                workspace,
-                psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                num_unaligned_recv_tokens_per_expert_ptr,
-                cumulative_local_expert_recv_stats_ptr,
-                nccl_context->scaleup_rank_idx,
-                current_streaming_generation,
-                nccl_context->num_ranks,
-                num_experts,
-                expert_alignment,
-                num_gpu_timeout_cycles,
-                completion_stream);
+        if (not export_streaming_lanes) {
+            if (previous_event_before_epilogue.has_value())
+                stream_wait(completion_stream, previous_event_before_epilogue.value());
+            if (run_rank_ready) {
+                launch_dispatch_rank_ready_prefix(
+                    workspace,
+                    psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                    psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                    num_unaligned_recv_tokens_per_expert_ptr,
+                    cumulative_local_expert_recv_stats_ptr,
+                    nccl_context->scaleup_rank_idx,
+                    current_streaming_generation,
+                    nccl_context->num_ranks,
+                    num_experts,
+                    expert_alignment,
+                    num_gpu_timeout_cycles,
+                    completion_stream);
+            }
+            launch_dispatch_copy_epilogue(buffer, workspace,
+                                          psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                          psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                          recv_x.data_ptr(), recv_sf_ptr,
+                                          recv_topk_idx_ptr, recv_topk_weights_ptr,
+                                          recv_src_metadata.data_ptr<int>(),
+                                          channel_linked_list_ptr,
+                                          num_unaligned_recv_tokens_per_expert_ptr,
+                                          num_recv_tokens, num_max_tokens_per_rank,
+                                          num_hidden_bytes,
+                                          num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                                          num_experts, num_topk, expert_alignment,
+                                          nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                                          nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                                          jit::device_runtime->get_num_sms(),
+                                          jit::device_runtime->get_num_smem_bytes(),
+                                          num_channels,
+                                          do_expand, cached_mode,
+                                          do_zero_padding,
+                                          not run_rank_ready,
+                                          completion_stream);
         }
-        launch_dispatch_copy_epilogue(buffer, workspace,
-                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
-                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
-                                      recv_topk_idx_ptr, recv_topk_weights_ptr,
-                                      recv_src_metadata.data_ptr<int>(),
-                                      channel_linked_list_ptr,
-                                      num_unaligned_recv_tokens_per_expert_ptr,
-                                      num_recv_tokens, num_max_tokens_per_rank,
-                                      num_hidden_bytes,
-                                      num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
-                                      num_experts, num_topk, expert_alignment,
-                                      nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
-                                      nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                                      jit::device_runtime->get_num_sms(),
-                                      jit::device_runtime->get_num_smem_bytes(),
-                                      num_channels,
-                                      do_expand, cached_mode,
-                                      do_zero_padding,
-                                      not run_rank_ready,
-                                      completion_stream);
 
         // Stream control
         const auto event = stream_control_epilogue_on_stream(
