@@ -546,6 +546,10 @@ class ElasticBuffer:
         ts: torch.Stream = self.runtime.get_comm_stream()
         return torch.cuda.Stream(stream_id=ts.stream_id, device_index=ts.device_index, device_type=ts.device_type)
 
+    def get_streaming_generation(self) -> int:
+        """Return the latest generation emitted on the streaming control plane."""
+        return self.runtime.get_streaming_generation()
+
     def get_streaming_lane_view(self):
         """Return lane-local tensors, psums, doorbells, and generation without a rank barrier."""
         return self.runtime.get_streaming_lane_view()

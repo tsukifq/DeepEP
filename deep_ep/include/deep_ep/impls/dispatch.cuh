@@ -63,6 +63,7 @@ template <bool kIsScaleupNVLink,
           bool kDoCPUSync,
           bool kReuseSlotIndices,
           bool kEmitStreamingSignals,
+          bool kBypassLegacyCompletion,
           int kNumSMs,
           int kNumNotifyWarps, int kNumDispatchWarps,
           int kNumRanks,
@@ -94,6 +95,8 @@ dispatch_impl(
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(not kEmitStreamingSignals or kIsScaleupNVLink,
                      "The first streaming producer milestone only supports NVLink scaleup");
+    EP_STATIC_ASSERT(not kBypassLegacyCompletion or kEmitStreamingSignals,
+                     "Bypassing legacy completion requires streaming signals");
 
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
@@ -118,10 +121,10 @@ dispatch_impl(
         sm_idx, warp_idx - kNumNotifyWarps, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // The experimental producer path owns a generation-tagged lane and does
-    // not require all source ranks to enter dispatch together. The legacy
-    // barrier remains the default until the ready-lane copy path is wired.
-    if constexpr (not kEmitStreamingSignals) {
+    // A lane consumer owns generation-tagged source readiness and can enter
+    // independently. Instrumented bulk publishes the same signals while
+    // deliberately retaining this upstream all-rank barrier.
+    if constexpr (not kBypassLegacyCompletion) {
         comm::gpu_barrier<kIsScaleupNVLink, 1, kNumRanks,
                           kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kDispatchTag0, false, false, true>(
             gin, workspace_layout, 0, rank_idx, sm_idx, thread_idx);
@@ -227,7 +230,7 @@ dispatch_impl(
             // consume the legacy rank/expert prefix. Returning the notify
             // warps here removes their all-rank count wait from this dispatch
             // generation without changing the default kernel specialization.
-            if constexpr (kEmitStreamingSignals)
+            if constexpr (kBypassLegacyCompletion)
                 return;
 
             // TODO: for further optimization, we can fuse rank and expert counters
@@ -488,9 +491,10 @@ dispatch_impl(
     }
 
     // Every local payload store and source-lane release is complete at this
-    // point. Streaming consumers own generation-tagged lifetime tracking, so
-    // they do not need the legacy all-rank completion barrier or PDL trigger.
-    if constexpr (kEmitStreamingSignals)
+    // point. Only a replacement consumer owns generation-tagged lifetime
+    // tracking; instrumented bulk still needs the legacy all-rank completion
+    // barrier, PDL trigger, and atomic-counter cleanup below.
+    if constexpr (kBypassLegacyCompletion)
         return;
 
     // Barrier to ensure data arrival

@@ -19,6 +19,7 @@ public:
         bool do_cpu_sync;
         bool reuse_slot_indices;
         bool emit_streaming_signals;
+        bool bypass_legacy_completion;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -54,11 +55,12 @@ public:
         std::string header_name, func_name;
         if (args.num_scaleout_ranks == 1) {
             header_name = "dispatch";
-            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.is_scaleup_nvlink,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.emit_streaming_signals,
+                args.bypass_legacy_completion,
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_dispatch_warps,
                 args.num_scaleup_ranks,
@@ -339,6 +341,7 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& emit_streaming_signals,
+                            const bool& bypass_legacy_completion,
                             const uint64_t& streaming_generation,
                             const bool& do_cpu_sync,
                             const at::cuda::CUDAStream& stream) {
@@ -380,6 +383,7 @@ static void launch_dispatch(void* x, void* sf,
         .do_cpu_sync = do_cpu_sync,
         .reuse_slot_indices = reuse_slot_indices,
         .emit_streaming_signals = emit_streaming_signals,
+        .bypass_legacy_completion = bypass_legacy_completion,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,

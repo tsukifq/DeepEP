@@ -193,6 +193,10 @@ public:
         return comm_stream;
     }
 
+    uint64_t get_streaming_generation() const {
+        return streaming_generation;
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, torch::Tensor,
                torch::Tensor, torch::Tensor, uint64_t>
@@ -1177,13 +1181,29 @@ public:
         const bool export_streaming_lanes = get_env<int>("EP_EXPERIMENTAL_STREAMING_LANES") != 0;
         const bool run_streaming_shadow = get_env<int>("EP_EXPERIMENTAL_STREAMING_COPY_SHADOW") != 0;
         const bool run_rank_ready = get_env<int>("EP_EXPERIMENTAL_RANK_READY") != 0;
+        const bool instrument_streaming_bulk =
+            get_env<int>("EP_EXPERIMENTAL_STREAMING_INSTRUMENTED_BULK") != 0;
+        const bool request_streaming_signals =
+            get_env<int>("EP_EXPERIMENTAL_STREAMING_SIGNALS") != 0;
         EP_HOST_ASSERT(static_cast<int>(export_streaming_lanes) +
                        static_cast<int>(run_streaming_shadow) +
-                       static_cast<int>(run_rank_ready) <= 1);
+                       static_cast<int>(run_rank_ready) +
+                       static_cast<int>(instrument_streaming_bulk) <= 1);
         const bool run_streaming_copy = export_streaming_lanes or run_streaming_shadow;
+        // Preserve the original signal-only switch as a safe bulk arm. It
+        // publishes the control plane, but still materializes and consumes
+        // the ordinary merged layout.
+        const bool run_signal_only =
+            request_streaming_signals and not run_streaming_copy and
+            not run_rank_ready and not instrument_streaming_bulk;
         const bool emit_streaming_signals =
-            run_streaming_copy or run_rank_ready or
-            get_env<int>("EP_EXPERIMENTAL_STREAMING_SIGNALS") != 0;
+            run_streaming_copy or run_rank_ready or instrument_streaming_bulk or
+            run_signal_only;
+        // Shadow/instrumented arms publish the generation control plane while
+        // retaining the upstream barrier, count exchange, and merged epilogue.
+        // Only a real lane consumer or rank-ready replacement may bypass it.
+        const bool bypass_legacy_completion =
+            export_streaming_lanes or run_rank_ready;
         EP_HOST_ASSERT(not emit_streaming_signals or
                        (nccl_context->num_scaleout_ranks == 1 and
                         nccl_context->is_scaleup_nvlink and not cached_mode));
@@ -1218,19 +1238,22 @@ public:
         } else {
             latest_streaming_return_buffer = nullptr;
         }
-        if (run_streaming_copy or run_rank_ready) {
+        if (emit_streaming_signals) {
             EP_HOST_ASSERT(not streaming_lane_view_outstanding and
                            "Previous streaming lane view was not released");
             if (streaming_consumer_event.has_value()) {
                 stream_wait(comm_stream, streaming_consumer_event.value());
                 streaming_consumer_event.reset();
             }
-            // Prevent the next producer generation from reusing workspace or
-            // ingress slots while the previous shadow consumer is still live.
-            stream_wait(comm_stream, streaming_copy_stream);
+            // Join the side stream only after a mode has actually used it.
+            // Instrumented bulk must not pay a synthetic empty-stream event.
+            if (streaming_copy_used)
+                stream_wait(comm_stream, streaming_copy_stream);
+        }
+        if (run_streaming_copy or run_rank_ready) {
             streaming_copy_used = true;
         }
-        if (export_streaming_lanes and current_streaming_generation > 1) {
+        if (emit_streaming_signals and current_streaming_generation > 1) {
             launch_dispatch_streaming_reuse_wait(
                 workspace, nccl_context->scaleup_rank_idx,
                 current_streaming_generation - 1,
@@ -1260,6 +1283,7 @@ public:
                         num_smem_bytes,
                         num_qps, num_gpu_timeout_cycles,
                         cached_mode, emit_streaming_signals,
+                        bypass_legacy_completion,
                         current_streaming_generation, do_cpu_sync,
                         comm_stream);
 
@@ -1532,6 +1556,29 @@ public:
                                           do_zero_padding,
                                           not run_rank_ready,
                                           completion_stream);
+            if (instrument_streaming_bulk or run_signal_only or run_rank_ready) {
+                // These modes consume the ordinary merged layout instead of
+                // exporting a lane view. Acknowledge the generation after the
+                // merged epilogue so a later streaming arm can safely reuse
+                // the same single-slot ingress workspace.
+                launch_dispatch_streaming_ack(
+                    nccl_context->dev_comm, nccl_context->window, workspace,
+                    nccl_context->scaleup_rank_idx,
+                    current_streaming_generation,
+                    nccl_context->num_ranks, num_experts,
+                    completion_stream);
+            } else if (run_streaming_shadow) {
+                // Shadow mode has two local readers: the ordinary merged
+                // epilogue and the sidecar copy. Join both before publishing
+                // the destination acknowledgement used by the next epoch.
+                stream_wait(streaming_copy_stream, completion_stream);
+                launch_dispatch_streaming_ack(
+                    nccl_context->dev_comm, nccl_context->window, workspace,
+                    nccl_context->scaleup_rank_idx,
+                    current_streaming_generation,
+                    nccl_context->num_ranks, num_experts,
+                    streaming_copy_stream);
+            }
         }
 
         // Stream control
@@ -1750,6 +1797,7 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<int, int, int64_t, symmetric::cpu_comm_t, int64_t, int64_t, bool, bool, bool, int, int, int, int, bool>())
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
+        .def("get_streaming_generation", &ElasticBuffer::get_streaming_generation)
         .def("get_streaming_lane_view", &ElasticBuffer::get_streaming_lane_view)
         .def("release_streaming_lane_view", &ElasticBuffer::release_streaming_lane_view)
         .def("streaming_combine_return", &ElasticBuffer::streaming_combine_return)

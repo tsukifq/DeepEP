@@ -143,6 +143,10 @@ if __name__ == '__main__':
 
         # CUDA 12 flags
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
+        # PyTorch does not propagate the regular nvcc architecture flags to
+        # its separate RDC device-link command. Without an explicit target,
+        # nvcc defaults that step to sm_52 and drops every sm_90 object.
+        nvcc_dlink.extend(['-gencode=arch=compute_90,code=sm_90'])
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':
