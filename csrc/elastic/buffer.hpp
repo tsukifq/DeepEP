@@ -43,14 +43,19 @@ class ElasticBuffer {
     mutable std::optional<torch::Tensor> latest_streaming_packed_topk_weights;
     mutable std::optional<torch::Tensor> latest_streaming_packed_src_metadata;
     mutable std::optional<EventHandle> streaming_consumer_event;
+    mutable std::optional<EventHandle> streaming_lane_drain_event;
     mutable uint64_t streaming_generation = 0;
     mutable uint64_t latest_streaming_generation = 0;
     mutable int latest_streaming_num_ranks = 0;
     mutable int latest_streaming_num_local_experts = 0;
     mutable int latest_streaming_lane_route_capacity = 0;
     mutable void* latest_streaming_return_buffer = nullptr;
+    mutable std::vector<bool> streaming_lane_return_submitted;
+    mutable std::vector<bool> streaming_lane_ingress_released;
+    mutable std::vector<std::optional<EventHandle>> streaming_lane_release_events;
     mutable bool streaming_copy_used = false;
     mutable bool streaming_lane_view_outstanding = false;
+    mutable bool streaming_generation_released_per_lane = false;
 
     // Whether to use hybrid mode (scale-out with scale-up)
     bool allow_hybrid_mode;
@@ -173,6 +178,8 @@ public:
         // The experimental copy consumer runs on a separate stream and may
         // outlive the legacy dispatch return event. Drain it before freeing
         // symmetric workspace or ingress buffers.
+        if (streaming_lane_drain_event.has_value())
+            stream_wait(comm_stream, streaming_lane_drain_event.value());
         if (streaming_copy_used)
             stream_wait(comm_stream, streaming_copy_stream);
 
@@ -244,15 +251,81 @@ public:
 
     void release_streaming_lane_view() const {
         EP_HOST_ASSERT(streaming_lane_view_outstanding);
+        EP_HOST_ASSERT(streaming_lane_ingress_released.size() ==
+                       static_cast<size_t>(latest_streaming_num_ranks));
+        EP_HOST_ASSERT(streaming_lane_release_events.size() ==
+                       static_cast<size_t>(latest_streaming_num_ranks));
+        uint32_t unreleased_source_mask = 0;
+        for (int source_rank_idx = 0;
+             source_rank_idx < latest_streaming_num_ranks;
+             ++ source_rank_idx) {
+            if (not streaming_lane_ingress_released[source_rank_idx])
+                unreleased_source_mask |= uint32_t{1} << source_rank_idx;
+        }
         const auto stream = at::cuda::getCurrentCUDAStream();
-        launch_dispatch_streaming_ack(
+        if (unreleased_source_mask != 0) {
+            // Backward-compatible whole-view release: the caller's stream is
+            // responsible for ordering all remaining consumers before this
+            // masked ACK.  Lanes released explicitly are not ACKed twice.
+            launch_dispatch_streaming_ack(
+                nccl_context->dev_comm, nccl_context->window, workspace,
+                nccl_context->scaleup_rank_idx, latest_streaming_generation,
+                latest_streaming_num_ranks,
+                latest_streaming_num_ranks * latest_streaming_num_local_experts,
+                stream, unreleased_source_mask);
+            streaming_consumer_event = EventHandle(stream);
+            streaming_generation_released_per_lane = false;
+        } else {
+            // Every source owns an independent device-side reuse dependency;
+            // do not recreate a destination-wide join on the comm stream.
+            EP_HOST_ASSERT(not streaming_consumer_event.has_value());
+            streaming_generation_released_per_lane = true;
+        }
+        // Aggregate the per-lane ACK completions only onto this lifetime
+        // stream.  The next dispatch does not consume this dependency.
+        for (const auto& release_event : streaming_lane_release_events) {
+            if (release_event.has_value())
+                stream_wait(stream, release_event.value());
+        }
+        // This event is a lifetime fence, not a next-generation dependency.
+        // Strict per-lane dispatch intentionally ignores it, while destroy()
+        // must retain a path to every outstanding ACK/return kernel.  Chain
+        // successive drain streams before replacing the retained event.
+        if (streaming_lane_drain_event.has_value())
+            stream_wait(stream, streaming_lane_drain_event.value());
+        streaming_lane_drain_event = EventHandle(stream);
+        streaming_lane_view_outstanding = false;
+    }
+
+    void release_streaming_lane(
+        const int& source_rank_idx,
+        const uint64_t& generation) const {
+        EP_HOST_ASSERT(streaming_lane_view_outstanding and
+                       "No streaming lane view is outstanding");
+        EP_HOST_ASSERT(generation == latest_streaming_generation and
+                       "Streaming lane release generation mismatch");
+        EP_HOST_ASSERT(0 <= source_rank_idx and
+                       source_rank_idx < latest_streaming_num_ranks);
+        EP_HOST_ASSERT(streaming_lane_return_submitted.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_ingress_released.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_release_events.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks));
+        EP_HOST_ASSERT(streaming_lane_return_submitted[source_rank_idx] and
+                       "Release must be submitted after streaming_combine_return");
+        EP_HOST_ASSERT(not streaming_lane_ingress_released[source_rank_idx] and
+                       "Streaming lane was already released");
+
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        launch_dispatch_streaming_lane_ack(
             nccl_context->dev_comm, nccl_context->window, workspace,
-            nccl_context->scaleup_rank_idx, latest_streaming_generation,
+            nccl_context->scaleup_rank_idx, source_rank_idx, generation,
             latest_streaming_num_ranks,
             latest_streaming_num_ranks * latest_streaming_num_local_experts,
-            stream);
-        streaming_consumer_event = EventHandle(at::cuda::getCurrentCUDAStream());
-        streaming_lane_view_outstanding = false;
+            num_gpu_timeout_cycles, stream);
+        streaming_lane_release_events[source_rank_idx] = EventHandle(stream);
+        streaming_lane_ingress_released[source_rank_idx] = true;
     }
 
     void streaming_combine_return(
@@ -271,6 +344,14 @@ public:
         EP_HOST_ASSERT(latest_streaming_return_buffer != nullptr);
         EP_HOST_ASSERT(0 <= source_rank_idx and
                        source_rank_idx < latest_streaming_num_ranks);
+        EP_HOST_ASSERT(streaming_lane_return_submitted.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_ingress_released.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks));
+        EP_HOST_ASSERT(not streaming_lane_return_submitted[source_rank_idx] and
+                       "Streaming lane return was already submitted");
+        EP_HOST_ASSERT(not streaming_lane_ingress_released[source_rank_idx] and
+                       "Cannot return a released streaming lane");
         EP_HOST_ASSERT(lane_output.dim() == 2 and lane_output.is_cuda() and
                        lane_output.is_contiguous() and
                        lane_output.scalar_type() == torch::kBFloat16);
@@ -301,6 +382,7 @@ public:
             stream);
         lane_output.record_stream(stream);
         lane_src_metadata.record_stream(stream);
+        streaming_lane_return_submitted[source_rank_idx] = true;
     }
 
     std::tuple<torch::Tensor, EventHandle> streaming_combine_reduce(
@@ -1241,14 +1323,22 @@ public:
         if (emit_streaming_signals) {
             EP_HOST_ASSERT(not streaming_lane_view_outstanding and
                            "Previous streaming lane view was not released");
-            if (streaming_consumer_event.has_value()) {
-                stream_wait(comm_stream, streaming_consumer_event.value());
-                streaming_consumer_event.reset();
+            if (not streaming_generation_released_per_lane) {
+                if (streaming_consumer_event.has_value()) {
+                    stream_wait(comm_stream, streaming_consumer_event.value());
+                    streaming_consumer_event.reset();
+                }
+                // Legacy/shadow release still has destination-wide lifetime
+                // semantics.  Preserve its local joins exactly.
+                if (streaming_copy_used)
+                    stream_wait(comm_stream, streaming_copy_stream);
+            } else {
+                // Per-source ACKs are consumed by the source-side reuse wait
+                // below.  Joining this destination's unrelated lane streams
+                // or copy grid here would recreate an implicit rank barrier.
+                EP_HOST_ASSERT(not streaming_consumer_event.has_value());
             }
-            // Join the side stream only after a mode has actually used it.
-            // Instrumented bulk must not pay a synthetic empty-stream event.
-            if (streaming_copy_used)
-                stream_wait(comm_stream, streaming_copy_stream);
+            streaming_generation_released_per_lane = false;
         }
         if (run_streaming_copy or run_rank_ready) {
             streaming_copy_used = true;
@@ -1477,6 +1567,12 @@ public:
                 latest_streaming_num_ranks = nccl_context->num_ranks;
                 latest_streaming_num_local_experts = num_local_experts;
                 latest_streaming_lane_route_capacity = lane_route_capacity;
+                streaming_lane_return_submitted.assign(
+                    nccl_context->num_ranks, false);
+                streaming_lane_ingress_released.assign(
+                    nccl_context->num_ranks, false);
+                streaming_lane_release_events.clear();
+                streaming_lane_release_events.resize(nccl_context->num_ranks);
                 streaming_lane_view_outstanding = true;
             }
         }
@@ -1799,6 +1895,7 @@ static void register_apis(pybind11::module_& m) {
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_streaming_generation", &ElasticBuffer::get_streaming_generation)
         .def("get_streaming_lane_view", &ElasticBuffer::get_streaming_lane_view)
+        .def("release_streaming_lane", &ElasticBuffer::release_streaming_lane)
         .def("release_streaming_lane_view", &ElasticBuffer::release_streaming_lane_view)
         .def("streaming_combine_return", &ElasticBuffer::streaming_combine_return)
         .def("streaming_combine_reduce", &ElasticBuffer::streaming_combine_reduce)

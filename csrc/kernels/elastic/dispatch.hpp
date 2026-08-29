@@ -202,6 +202,7 @@ public:
         void* workspace;
         int destination_rank_idx;
         uint64_t generation;
+        uint32_t source_rank_mask;
         jit::LaunchArgs launch_args;
     };
 
@@ -223,7 +224,8 @@ static void __instantiate_kernel() {{
         EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
             kernel, config,
             args.nccl_dev_comm, args.nccl_window, args.workspace,
-            args.destination_rank_idx, args.generation));
+            args.destination_rank_idx, args.generation,
+            args.source_rank_mask));
     }
 };
 
@@ -235,7 +237,8 @@ static void launch_dispatch_streaming_ack(
     const uint64_t& generation,
     const int& num_ranks,
     const int& num_experts,
-    const at::cuda::CUDAStream& stream) {
+    const at::cuda::CUDAStream& stream,
+    const uint32_t& source_rank_mask = ~uint32_t{0}) {
     const DispatchStreamingAckRuntime::Args args = {
         .num_ranks = num_ranks,
         .num_experts = num_experts,
@@ -244,11 +247,78 @@ static void launch_dispatch_streaming_ack(
         .workspace = workspace,
         .destination_rank_idx = destination_rank_idx,
         .generation = generation,
+        .source_rank_mask = source_rank_mask,
         .launch_args = jit::LaunchArgs(1, 32, 0)};
     const auto runtime = jit::compiler->build(
         "dispatch_streaming_ack",
         DispatchStreamingAckRuntime::generate(args));
     DispatchStreamingAckRuntime::launch(runtime, args, stream);
+}
+
+class DispatchStreamingLaneAckRuntime final
+    : public jit::LaunchRuntime<DispatchStreamingLaneAckRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts;
+        int64_t num_timeout_cycles;
+        jit::NoRefPtr nccl_dev_comm;
+        ncclWindow_t nccl_window;
+        void* workspace;
+        int destination_rank_idx;
+        int source_rank_idx;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/dispatch_streaming_reuse.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_streaming_lane_ack_impl<{}, {}, {}>);
+}}
+)", args.num_ranks, args.num_experts, args.num_timeout_cycles);
+    }
+
+    static void launch_impl(const jit::KernelHandle& kernel,
+                            const jit::LaunchConfigHandle& config,
+                            Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config,
+            args.nccl_dev_comm, args.nccl_window, args.workspace,
+            args.destination_rank_idx, args.source_rank_idx,
+            args.generation));
+    }
+};
+
+static void launch_dispatch_streaming_lane_ack(
+    const jit::NoRefPtr& nccl_dev_comm,
+    const ncclWindow_t& nccl_window,
+    void* workspace,
+    const int& destination_rank_idx,
+    const int& source_rank_idx,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const int64_t& num_timeout_cycles,
+    const at::cuda::CUDAStream& stream) {
+    const DispatchStreamingLaneAckRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .num_timeout_cycles = num_timeout_cycles,
+        .nccl_dev_comm = nccl_dev_comm,
+        .nccl_window = nccl_window,
+        .workspace = workspace,
+        .destination_rank_idx = destination_rank_idx,
+        .source_rank_idx = source_rank_idx,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0)};
+    const auto runtime = jit::compiler->build(
+        "dispatch_streaming_lane_ack",
+        DispatchStreamingLaneAckRuntime::generate(args));
+    DispatchStreamingLaneAckRuntime::launch(runtime, args, stream);
 }
 
 class DispatchStreamingReuseWaitRuntime final

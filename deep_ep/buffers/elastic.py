@@ -554,8 +554,19 @@ class ElasticBuffer:
         """Return lane-local tensors, psums, doorbells, and generation without a rank barrier."""
         return self.runtime.get_streaming_lane_view()
 
+    def release_streaming_lane(self, source_rank: int, generation: int) -> None:
+        """Release one source ingress after its streaming return is submitted.
+
+        The device-side ACK waits for the matching return kernel to finish its
+        final reads of the generation-tagged payload/count control.  This call
+        must follow ``streaming_combine_return`` for the same source and
+        generation.  Call ``release_streaming_lane_view`` after all lane work
+        and source reduction have been submitted to finalize the local view.
+        """
+        self.runtime.release_streaming_lane(source_rank, generation)
+
     def release_streaming_lane_view(self) -> None:
-        """Record current-stream consumption before dispatch reuses lane doorbells."""
+        """Finalize the view and compatibly ACK any unreleased source lanes."""
         self.runtime.release_streaming_lane_view()
 
     def streaming_combine_return(

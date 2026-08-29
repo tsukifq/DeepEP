@@ -39,7 +39,9 @@ struct alignas(64) LaneControl {
     uint64_t generation;
     uint64_t payload_done_seq;
     uint64_t pack_done_seq;
-    uint64_t gemm_done_seq;
+    // The return kernel is the final reader of this generation's ingress
+    // payload/count control.  It publishes this sequence before reuse ACK.
+    uint64_t ingress_consumed_seq;
     uint64_t ack_seq;
 
     uint32_t num_unique_tokens;
@@ -128,15 +130,15 @@ __forceinline__ __device__ bool acquire_pack_ready(
     return ptx::ld_acquire_sys(&lane->pack_done_seq) == expected_generation;
 }
 
-__forceinline__ __device__ void publish_gemm_done(
+__forceinline__ __device__ void publish_ingress_consumed(
     LaneControl* lane, const uint64_t& generation) {
     ptx::st_relaxed_sys(&lane->state, static_cast<uint32_t>(LaneState::kGemmDone));
-    ptx::st_release_sys(&lane->gemm_done_seq, generation);
+    ptx::st_release_sys(&lane->ingress_consumed_seq, generation);
 }
 
-__forceinline__ __device__ bool acquire_gemm_done(
+__forceinline__ __device__ bool acquire_ingress_consumed(
     const LaneControl* lane, const uint64_t& expected_generation) {
-    return ptx::ld_acquire_sys(&lane->gemm_done_seq) == expected_generation;
+    return ptx::ld_acquire_sys(&lane->ingress_consumed_seq) == expected_generation;
 }
 
 __forceinline__ __device__ void publish_ack(

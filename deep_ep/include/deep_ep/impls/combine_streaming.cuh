@@ -52,7 +52,7 @@ combine_streaming_return_impl(
         token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
     const auto workspace_layout = layout::WorkspaceLayout(
         workspace, 1, kNumRanks, kNumExperts);
-    const auto* lane_control =
+    auto* lane_control =
         workspace_layout.get_streaming_lane_control_ptr(source_rank_idx);
     const int num_source_tokens = lane_control->num_unique_tokens;
     const int num_source_routes = lane_control->num_routes;
@@ -152,6 +152,11 @@ combine_streaming_return_impl(
         EP_DEVICE_ASSERT(remote_control != nullptr);
         ptx::st_relaxed_sys(&remote_control->generation, generation);
         streaming::publish_return_ready(remote_control, generation, num_source_routes);
+
+        // This is the final access to the generation's ingress payload/count
+        // control.  A per-source release kernel waits for this sequence before
+        // acknowledging that the source may overwrite its single-slot lane.
+        streaming::publish_ingress_consumed(lane_control, generation);
     }
 }
 
