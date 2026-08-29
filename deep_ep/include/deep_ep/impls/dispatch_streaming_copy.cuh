@@ -29,6 +29,7 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
                              const int packed_sf_token_stride,
                              const int packed_sf_hidden_stride,
                              const int destination_rank_idx,
+                             const int source_rank_idx,
                              const uint64_t generation) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kRawLaneRouteCapacity =
@@ -45,10 +46,10 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
     EP_STATIC_ASSERT(kNumExpertsPerRank <= layout::WorkspaceLayout::kNumMaxExpertsPerRank,
                      "Too many local experts");
 
-    const auto source_rank_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
-    EP_DEVICE_ASSERT(source_rank_idx < kNumRanks);
+    EP_DEVICE_ASSERT(blockIdx.x == 0);
+    EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);
 
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     auto* lane_control = workspace_layout.get_streaming_lane_control_ptr(source_rank_idx);

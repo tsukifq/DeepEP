@@ -239,6 +239,116 @@ def test_per_source_release_removes_only_the_strict_generation_wide_joins():
     )
 
 
+def test_streaming_copy_launches_one_runtime_selected_source_per_stream():
+    device_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/dispatch_streaming_copy.cuh"
+    ).read_text(encoding="utf-8")
+    host_source = (ROOT / "csrc/kernels/elastic/dispatch.hpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "const int source_rank_idx," in device_source
+    assert "source_rank_idx = static_cast<int>(blockIdx.x)" not in device_source
+    assert "EP_DEVICE_ASSERT(blockIdx.x == 0);" in device_source
+    assert (
+        "EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);"
+        in device_source
+    )
+
+    launch = host_source.index("static void launch_dispatch_streaming_copy(")
+    launch_end = host_source.index(
+        "class DispatchRankReadyPrefixRuntime", launch
+    )
+    launch_source = host_source[launch:launch_end]
+    build = launch_source.index(
+        'jit::compiler->build("dispatch_streaming_copy", code)'
+    )
+    source_loop = launch_source.index(
+        "for (int source_rank_idx = 0; source_rank_idx < num_ranks;"
+    )
+    source_launch = launch_source.index(
+        "DispatchStreamingCopyRuntime::launch(", source_loop
+    )
+    assert ".launch_args = jit::LaunchArgs(\n            1," in launch_source
+    assert launch_source.count(
+        'jit::compiler->build("dispatch_streaming_copy", code)'
+    ) == 1
+    assert build < source_loop < source_launch
+    assert "source_args.source_rank_idx = source_rank_idx;" in launch_source
+    assert "source_streams[source_rank_idx]" in launch_source
+
+
+def test_streaming_copy_owns_fixed_source_streams_and_all_tensor_lifetimes():
+    source = (ROOT / "csrc/elastic/buffer.hpp").read_text(encoding="utf-8")
+
+    assert (
+        "std::vector<at::cuda::CUDAStream> streaming_lane_copy_streams;"
+        in source
+    )
+    constructor = source.index("ElasticBuffer(const int& rank_idx")
+    constructor_end = source.index("~ElasticBuffer()", constructor)
+    constructor_source = source[constructor:constructor_end]
+    assert (
+        "streaming_lane_copy_streams.reserve(nccl_context->num_ranks);"
+        in constructor_source
+    )
+    assert (
+        "streaming_lane_copy_streams.emplace_back(\n"
+        "                at::cuda::getStreamFromPool(false));"
+        in constructor_source
+    )
+
+    launch = source.index("launch_dispatch_streaming_copy(")
+    records = source.index(
+        "for (const auto& source_stream : streaming_lane_copy_streams)", launch
+    )
+    records_end = source.index("if (export_streaming_lanes)", records)
+    record_source = source[records:records_end]
+    for tensor_name in (
+        "streaming_packed_x",
+        "streaming_packed_sf",
+        "streaming_packed_topk_weights",
+        "streaming_packed_src_metadata",
+        "streaming_packed_lane_control",
+    ):
+        assert f"{tensor_name}->record_stream(source_stream);" in record_source
+
+
+def test_streaming_copy_lifecycle_joins_every_source_without_changing_rank_ready():
+    source = (ROOT / "csrc/elastic/buffer.hpp").read_text(encoding="utf-8")
+
+    destroy = source.index("void destroy()")
+    destroy_end = source.index("torch::Stream get_comm_stream()", destroy)
+    destroy_source = source[destroy:destroy_end]
+    assert "if (streaming_copy_used)" in destroy_source
+    assert "stream_wait(comm_stream, streaming_copy_stream);" in destroy_source
+    assert "if (streaming_lane_copy_used)" in destroy_source
+    assert "for (const auto& source_stream : streaming_lane_copy_streams)" in destroy_source
+    assert "stream_wait(comm_stream, source_stream);" in destroy_source
+
+    legacy = source.index("if (not streaming_generation_released_per_lane)")
+    legacy_end = source.index("} else {", legacy)
+    legacy_source = source[legacy:legacy_end]
+    assert "stream_wait(comm_stream, streaming_copy_stream);" in legacy_source
+    assert "for (const auto& source_stream : streaming_lane_copy_streams)" in legacy_source
+    assert "stream_wait(comm_stream, source_stream);" in legacy_source
+
+    shadow = source.index("} else if (run_streaming_shadow) {")
+    shadow_end = source.index("launch_dispatch_streaming_ack(", shadow)
+    shadow_source = source[shadow:shadow_end]
+    assert "stream_wait(streaming_copy_stream, completion_stream);" in shadow_source
+    assert "for (const auto& source_stream : streaming_lane_copy_streams)" in shadow_source
+    assert "stream_wait(streaming_copy_stream, source_stream);" in shadow_source
+
+    # Rank-ready retains the original single-stream prefix/merged epilogue.
+    assert (
+        "const auto completion_stream = run_rank_ready ? streaming_copy_stream : comm_stream;"
+        in source
+    )
+    assert "if (run_rank_ready or run_streaming_shadow)" in source
+    assert "if (run_streaming_copy)\n            streaming_lane_copy_used = true;" in source
+
+
 def test_sm90_rdc_device_link_keeps_the_target_architecture():
     source = (ROOT / "setup.py").read_text(encoding="utf-8")
 

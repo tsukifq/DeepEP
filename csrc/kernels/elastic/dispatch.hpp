@@ -2,6 +2,7 @@
 
 #include <nccl.h>
 #include <nccl_device.h>
+#include <vector>
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
@@ -510,7 +511,7 @@ public:
         int* packed_src_metadata;
         int* packed_lane_control;
         int packed_sf_token_stride, packed_sf_hidden_stride;
-        int destination_rank_idx;
+        int destination_rank_idx, source_rank_idx;
         uint64_t generation;
 
         jit::LaunchArgs launch_args;
@@ -542,7 +543,8 @@ static void __instantiate_kernel() {{
             args.packed_src_metadata,
             args.packed_lane_control,
             args.packed_sf_token_stride, args.packed_sf_hidden_stride,
-            args.destination_rank_idx, args.generation));
+            args.destination_rank_idx, args.source_rank_idx,
+            args.generation));
     }
 };
 
@@ -561,7 +563,8 @@ static void launch_dispatch_streaming_copy(
     const int& num_experts, const int& num_topk,
     const int& num_smem_bytes,
     const int64_t& num_timeout_cycles,
-    const at::cuda::CUDAStream& stream) {
+    const std::vector<at::cuda::CUDAStream>& source_streams) {
+    EP_HOST_ASSERT(source_streams.size() == static_cast<size_t>(num_ranks));
     const auto token_layout = layout::TokenLayout(
         num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
     const auto num_warps = std::min(
@@ -584,12 +587,20 @@ static void launch_dispatch_streaming_copy(
         .packed_sf_token_stride = packed_sf_token_stride,
         .packed_sf_hidden_stride = packed_sf_hidden_stride,
         .destination_rank_idx = destination_rank_idx,
+        .source_rank_idx = 0,
         .generation = generation,
         .launch_args = jit::LaunchArgs(
-            num_ranks, num_warps * 32, streaming_smem_bytes)};
+            1, num_warps * 32, streaming_smem_bytes)};
     const auto code = DispatchStreamingCopyRuntime::generate(args);
+    // The specialization is identical for every source: build it once, then
+    // pass source_rank_idx as a runtime argument to one CTA on each FIFO.
     const auto runtime = jit::compiler->build("dispatch_streaming_copy", code);
-    DispatchStreamingCopyRuntime::launch(runtime, args, stream);
+    for (int source_rank_idx = 0; source_rank_idx < num_ranks; ++ source_rank_idx) {
+        auto source_args = args;
+        source_args.source_rank_idx = source_rank_idx;
+        DispatchStreamingCopyRuntime::launch(
+            runtime, source_args, source_streams[source_rank_idx]);
+    }
 }
 
 class DispatchRankReadyPrefixRuntime final : public jit::LaunchRuntime<DispatchRankReadyPrefixRuntime> {

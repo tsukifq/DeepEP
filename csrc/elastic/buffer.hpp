@@ -37,7 +37,10 @@ class ElasticBuffer {
 
     // CUDA streams
     at::cuda::CUDAStream comm_stream;
+    // Preserve the original single-stream rank-ready/merged-epilogue path.
     at::cuda::CUDAStream streaming_copy_stream;
+    // Packed streaming ingress owns one fixed FIFO stream per source rank.
+    std::vector<at::cuda::CUDAStream> streaming_lane_copy_streams;
     mutable std::optional<torch::Tensor> latest_streaming_packed_x;
     mutable std::optional<torch::Tensor> latest_streaming_packed_sf;
     mutable std::optional<torch::Tensor> latest_streaming_packed_topk_weights;
@@ -56,6 +59,7 @@ class ElasticBuffer {
     mutable std::vector<std::optional<EventHandle>> streaming_lane_release_events;
     mutable std::vector<std::optional<EventHandle>> streaming_lane_return_events;
     mutable bool streaming_copy_used = false;
+    mutable bool streaming_lane_copy_used = false;
     mutable bool streaming_lane_view_outstanding = false;
     mutable bool streaming_generation_released_per_lane = false;
 
@@ -136,6 +140,17 @@ public:
             num_sym_bytes, num_cpu_buffer_bytes,
             allow_hybrid_mode, sl_idx, num_allocated_qps);
 
+        // Allocate these once so source s always reuses the same stream. CUDA
+        // stream FIFO gives generations of one source strict order, while
+        // distinct sources can make progress independently.
+        streaming_lane_copy_streams.reserve(nccl_context->num_ranks);
+        for (int source_rank_idx = 0;
+             source_rank_idx < nccl_context->num_ranks;
+             ++ source_rank_idx) {
+            streaming_lane_copy_streams.emplace_back(
+                at::cuda::getStreamFromPool(false));
+        }
+
         // Verify the symmetric memory layout matches our expectations
         EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
         EP_HOST_ASSERT(num_cpu_buffer_bytes == nccl_context->num_cpu_bytes);
@@ -177,13 +192,17 @@ public:
         EP_HOST_ASSERT(not streaming_lane_view_outstanding and
                        "Call release_streaming_lane_view() before destroy()");
 
-        // The experimental copy consumer runs on a separate stream and may
-        // outlive the legacy dispatch return event. Drain it before freeing
-        // symmetric workspace or ingress buffers.
+        // The experimental copy consumers run on fixed per-source streams
+        // and may outlive the legacy dispatch return event. Drain every one
+        // before freeing symmetric workspace or ingress buffers.
         if (streaming_lane_drain_event.has_value())
             stream_wait(comm_stream, streaming_lane_drain_event.value());
         if (streaming_copy_used)
             stream_wait(comm_stream, streaming_copy_stream);
+        if (streaming_lane_copy_used) {
+            for (const auto& source_stream : streaming_lane_copy_streams)
+                stream_wait(comm_stream, source_stream);
+        }
 
         // Finish all works on all GPUs
         barrier(true, true);
@@ -1359,17 +1378,23 @@ public:
                 // semantics.  Preserve its local joins exactly.
                 if (streaming_copy_used)
                     stream_wait(comm_stream, streaming_copy_stream);
+                if (streaming_lane_copy_used) {
+                    for (const auto& source_stream : streaming_lane_copy_streams)
+                        stream_wait(comm_stream, source_stream);
+                }
             } else {
                 // Per-source ACKs are consumed by the source-side reuse wait
                 // below.  Joining this destination's unrelated lane streams
-                // or copy grid here would recreate an implicit rank barrier.
+                // here would recreate an implicit rank barrier.
                 EP_HOST_ASSERT(not streaming_consumer_event.has_value());
             }
             streaming_generation_released_per_lane = false;
         }
-        if (run_streaming_copy or run_rank_ready) {
+        if (run_rank_ready or run_streaming_shadow) {
             streaming_copy_used = true;
         }
+        if (run_streaming_copy)
+            streaming_lane_copy_used = true;
         if (emit_streaming_signals and current_streaming_generation > 1) {
             launch_dispatch_streaming_reuse_wait(
                 workspace, nccl_context->scaleup_rank_idx,
@@ -1582,17 +1607,20 @@ public:
                 num_experts, num_topk,
                 jit::device_runtime->get_num_smem_bytes(),
                 num_gpu_timeout_cycles,
-                streaming_copy_stream);
+                streaming_lane_copy_streams);
 
-            // Record the producer stream so the allocator cannot recycle the
-            // storage while the copy grid is still active.
-            streaming_packed_x->record_stream(streaming_copy_stream);
-            if (streaming_packed_sf.has_value())
-                streaming_packed_sf->record_stream(streaming_copy_stream);
-            if (streaming_packed_topk_weights.has_value())
-                streaming_packed_topk_weights->record_stream(streaming_copy_stream);
-            streaming_packed_src_metadata->record_stream(streaming_copy_stream);
-            streaming_packed_lane_control->record_stream(streaming_copy_stream);
+            // Every source stream touches a disjoint slice of every packed
+            // allocation. Record all producers so the allocator cannot reuse
+            // storage until the slowest source kernel has retired.
+            for (const auto& source_stream : streaming_lane_copy_streams) {
+                streaming_packed_x->record_stream(source_stream);
+                if (streaming_packed_sf.has_value())
+                    streaming_packed_sf->record_stream(source_stream);
+                if (streaming_packed_topk_weights.has_value())
+                    streaming_packed_topk_weights->record_stream(source_stream);
+                streaming_packed_src_metadata->record_stream(source_stream);
+                streaming_packed_lane_control->record_stream(source_stream);
+            }
 
             if (export_streaming_lanes) {
                 latest_streaming_packed_x = streaming_packed_x;
@@ -1704,9 +1732,12 @@ public:
                     completion_stream);
             } else if (run_streaming_shadow) {
                 // Shadow mode has two local readers: the ordinary merged
-                // epilogue and the sidecar copy. Join both before publishing
-                // the destination acknowledgement used by the next epoch.
+                // epilogue and every sidecar source copy. Aggregate them on
+                // the original auxiliary stream before publishing the
+                // destination acknowledgement used by the next epoch.
                 stream_wait(streaming_copy_stream, completion_stream);
+                for (const auto& source_stream : streaming_lane_copy_streams)
+                    stream_wait(streaming_copy_stream, source_stream);
                 launch_dispatch_streaming_ack(
                     nccl_context->dev_comm, nccl_context->window, workspace,
                     nccl_context->scaleup_rank_idx,
