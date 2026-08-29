@@ -27,6 +27,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 combine_streaming_return_impl(
     nv_bfloat16* lane_output,
     int* lane_src_metadata,
+    const int* lane_counts,
     const int lane_base_row,
     const int lane_capacity,
     const ncclDevComm_t nccl_dev_comm,
@@ -52,10 +53,10 @@ combine_streaming_return_impl(
         token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
     const auto workspace_layout = layout::WorkspaceLayout(
         workspace, 1, kNumRanks, kNumExperts);
-    auto* lane_control =
-        workspace_layout.get_streaming_lane_control_ptr(source_rank_idx);
-    const int num_source_tokens = lane_control->num_unique_tokens;
-    const int num_source_routes = lane_control->num_routes;
+    // Counts are a generation-owned copy sidecar. The source may already be
+    // writing its next single-slot ingress and LaneControl at this point.
+    const int num_source_tokens = lane_counts[0];
+    const int num_source_routes = lane_counts[1];
     EP_DEVICE_ASSERT(0 <= num_source_tokens and
                      num_source_tokens <= kNumMaxTokensPerRank);
     EP_DEVICE_ASSERT(num_source_routes >= 0);
@@ -152,11 +153,6 @@ combine_streaming_return_impl(
         EP_DEVICE_ASSERT(remote_control != nullptr);
         ptx::st_relaxed_sys(&remote_control->generation, generation);
         streaming::publish_return_ready(remote_control, generation, num_source_routes);
-
-        // This is the final access to the generation's ingress payload/count
-        // control.  A per-source release kernel waits for this sequence before
-        // acknowledging that the source may overwrite its single-slot lane.
-        streaming::publish_ingress_consumed(lane_control, generation);
     }
 }
 

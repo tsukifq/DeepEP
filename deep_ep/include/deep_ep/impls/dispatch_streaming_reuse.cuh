@@ -49,11 +49,12 @@ dispatch_streaming_ack_impl(const ncclDevComm_t nccl_dev_comm,
     ptx::st_release_sys(&remote_ack_slot->ack_seq, generation);
 }
 
-// Release one source's single-slot ingress independently.  The streaming
-// return kernel is the final reader of this source lane's shared payload/count
-// control, and publishes ingress_consumed_seq only after that read and all
-// remote return writes have completed.  Waiting here makes the API safe even
-// if the host submits the acknowledgement on another stream.
+// Release one source's single-slot ingress independently. The copy CTA
+// publishes ingress_consumed_seq after snapshotting every downstream payload,
+// count, and psum into generation-owned tensors. The caller must queue this
+// kernel on the same lane stream after its pack_done == generation wait; that
+// ordering prevents a later generation from overwriting the shared doorbell
+// before the consumer has observed it.
 template <int kNumRanks, int kNumExperts, int64_t kNumTimeoutCycles,
           int kNumThreads = 32>
 __global__ void __launch_bounds__(kNumThreads, 1)
@@ -81,7 +82,7 @@ dispatch_streaming_lane_ack_impl(const ncclDevComm_t nccl_dev_comm,
         if (streaming::acquire_ingress_consumed(source_lane, generation))
             return true;
         if (is_last_check) {
-            printf("DeepEP streaming lane release timeout, dst: %d, src: %d, expected generation: %llu, control generation: %llu, observed consumer done: %llu\n",
+            printf("DeepEP streaming lane release timeout, dst: %d, src: %d, expected generation: %llu, control generation: %llu, observed ingress snapshot: %llu\n",
                    destination_rank_idx, source_rank_idx,
                    static_cast<unsigned long long>(generation),
                    static_cast<unsigned long long>(

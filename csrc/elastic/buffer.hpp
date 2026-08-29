@@ -42,6 +42,7 @@ class ElasticBuffer {
     mutable std::optional<torch::Tensor> latest_streaming_packed_sf;
     mutable std::optional<torch::Tensor> latest_streaming_packed_topk_weights;
     mutable std::optional<torch::Tensor> latest_streaming_packed_src_metadata;
+    mutable std::optional<torch::Tensor> latest_streaming_packed_lane_control;
     mutable std::optional<EventHandle> streaming_consumer_event;
     mutable std::optional<EventHandle> streaming_lane_drain_event;
     mutable uint64_t streaming_generation = 0;
@@ -53,6 +54,7 @@ class ElasticBuffer {
     mutable std::vector<bool> streaming_lane_return_submitted;
     mutable std::vector<bool> streaming_lane_ingress_released;
     mutable std::vector<std::optional<EventHandle>> streaming_lane_release_events;
+    mutable std::vector<std::optional<EventHandle>> streaming_lane_return_events;
     mutable bool streaming_copy_used = false;
     mutable bool streaming_lane_view_outstanding = false;
     mutable bool streaming_generation_released_per_lane = false;
@@ -204,23 +206,25 @@ public:
         return streaming_generation;
     }
 
+    int get_streaming_lane_protocol_version() const {
+        // Version 2 makes lane control generation-owned and permits ingress
+        // release after the matching pack doorbell has been observed.
+        return 2;
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, torch::Tensor,
                torch::Tensor, torch::Tensor, uint64_t>
     get_streaming_lane_view() const {
         EP_HOST_ASSERT(streaming_lane_view_outstanding and
                        latest_streaming_packed_x.has_value() and
-                       latest_streaming_packed_src_metadata.has_value());
+                       latest_streaming_packed_src_metadata.has_value() and
+                       latest_streaming_packed_lane_control.has_value());
         const auto num_ranks = latest_streaming_num_ranks;
         const auto num_local_experts = latest_streaming_num_local_experts;
         const auto lane_capacity = latest_streaming_lane_route_capacity;
         const auto workspace_layout = layout::WorkspaceLayout(
             workspace, 1, num_ranks, num_ranks * num_local_experts);
-        auto lane_psum_storage = torch::from_blob(
-            workspace_layout.get_streaming_lane_psum_ptr(0),
-            {num_ranks, 1 + layout::WorkspaceLayout::kNumMaxExpertsPerRank},
-            {1 + layout::WorkspaceLayout::kNumMaxExpertsPerRank, 1},
-            torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA));
         auto pack_done_seq = torch::from_blob(
             &workspace_layout.get_streaming_lane_control_ptr(0)->pack_done_seq,
             {num_ranks},
@@ -244,7 +248,8 @@ public:
                 std::make_optional(latest_streaming_packed_topk_weights->view(
                     {num_ranks, lane_capacity})) : std::nullopt,
             latest_streaming_packed_src_metadata.value(),
-            lane_psum_storage.slice(1, 0, num_local_experts),
+            latest_streaming_packed_lane_control->slice(
+                1, 2, 2 + num_local_experts),
             pack_done_seq,
             latest_streaming_generation};
     }
@@ -254,6 +259,8 @@ public:
         EP_HOST_ASSERT(streaming_lane_ingress_released.size() ==
                        static_cast<size_t>(latest_streaming_num_ranks));
         EP_HOST_ASSERT(streaming_lane_release_events.size() ==
+                       static_cast<size_t>(latest_streaming_num_ranks));
+        EP_HOST_ASSERT(streaming_lane_return_events.size() ==
                        static_cast<size_t>(latest_streaming_num_ranks));
         uint32_t unreleased_source_mask = 0;
         for (int source_rank_idx = 0;
@@ -277,8 +284,18 @@ public:
             streaming_generation_released_per_lane = false;
         } else {
             // Every source owns an independent device-side reuse dependency;
-            // do not recreate a destination-wide join on the comm stream.
+            // require every generation-owned return to be submitted before
+            // making the view reusable, then avoid recreating a
+            // destination-wide join on the comm stream.
             EP_HOST_ASSERT(not streaming_consumer_event.has_value());
+            for (int source_rank_idx = 0;
+                 source_rank_idx < latest_streaming_num_ranks;
+                 ++ source_rank_idx) {
+                EP_HOST_ASSERT(
+                    streaming_lane_return_submitted[source_rank_idx] and
+                    streaming_lane_return_events[source_rank_idx].has_value() and
+                    "All per-lane returns must be submitted before strict view finalization");
+            }
             streaming_generation_released_per_lane = true;
         }
         // Aggregate the per-lane ACK completions only onto this lifetime
@@ -286,6 +303,10 @@ public:
         for (const auto& release_event : streaming_lane_release_events) {
             if (release_event.has_value())
                 stream_wait(stream, release_event.value());
+        }
+        for (const auto& return_event : streaming_lane_return_events) {
+            if (return_event.has_value())
+                stream_wait(stream, return_event.value());
         }
         // This event is a lifetime fence, not a next-generation dependency.
         // Strict per-lane dispatch intentionally ignores it, while destroy()
@@ -312,8 +333,6 @@ public:
                            static_cast<size_t>(latest_streaming_num_ranks) and
                        streaming_lane_release_events.size() ==
                            static_cast<size_t>(latest_streaming_num_ranks));
-        EP_HOST_ASSERT(streaming_lane_return_submitted[source_rank_idx] and
-                       "Release must be submitted after streaming_combine_return");
         EP_HOST_ASSERT(not streaming_lane_ingress_released[source_rank_idx] and
                        "Streaming lane was already released");
 
@@ -336,7 +355,8 @@ public:
         EP_HOST_ASSERT(get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0 and
                        "Streaming layer return is disabled");
         EP_HOST_ASSERT(streaming_lane_view_outstanding and
-                       latest_streaming_packed_x.has_value());
+                       latest_streaming_packed_x.has_value() and
+                       latest_streaming_packed_lane_control.has_value());
         EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and
                        nccl_context->is_scaleup_nvlink and
                        "Streaming layer return requires one NVLink scale-up domain");
@@ -347,11 +367,11 @@ public:
         EP_HOST_ASSERT(streaming_lane_return_submitted.size() ==
                            static_cast<size_t>(latest_streaming_num_ranks) and
                        streaming_lane_ingress_released.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_return_events.size() ==
                            static_cast<size_t>(latest_streaming_num_ranks));
         EP_HOST_ASSERT(not streaming_lane_return_submitted[source_rank_idx] and
                        "Streaming lane return was already submitted");
-        EP_HOST_ASSERT(not streaming_lane_ingress_released[source_rank_idx] and
-                       "Cannot return a released streaming lane");
         EP_HOST_ASSERT(lane_output.dim() == 2 and lane_output.is_cuda() and
                        lane_output.is_contiguous() and
                        lane_output.scalar_type() == torch::kBFloat16);
@@ -361,6 +381,10 @@ public:
                        lane_src_metadata.is_cuda() and
                        lane_src_metadata.is_contiguous() and
                        lane_src_metadata.scalar_type() == torch::kInt);
+        const auto lane_control_stride = 2 + latest_streaming_num_local_experts;
+        const auto lane_counts =
+            latest_streaming_packed_lane_control->data_ptr<int>() +
+            source_rank_idx * lane_control_stride;
         const int num_topk = lane_src_metadata.size(1) - 2;
         const int num_max_tokens_per_rank = lane_src_metadata.size(0);
         EP_HOST_ASSERT(num_topk > 0 and num_max_tokens_per_rank > 0);
@@ -368,6 +392,7 @@ public:
         const auto stream = at::cuda::getCurrentCUDAStream();
         launch_streaming_combine_return(
             lane_output.data_ptr(), lane_src_metadata.data_ptr<int>(),
+            lane_counts,
             source_rank_idx * latest_streaming_lane_route_capacity,
             latest_streaming_lane_route_capacity,
             nccl_context->dev_comm, nccl_context->window,
@@ -382,6 +407,8 @@ public:
             stream);
         lane_output.record_stream(stream);
         lane_src_metadata.record_stream(stream);
+        latest_streaming_packed_lane_control->record_stream(stream);
+        streaming_lane_return_events[source_rank_idx] = EventHandle(stream);
         streaming_lane_return_submitted[source_rank_idx] = true;
     }
 
@@ -1492,6 +1519,7 @@ public:
         auto streaming_packed_sf = std::optional<torch::Tensor>();
         auto streaming_packed_topk_weights = std::optional<torch::Tensor>();
         auto streaming_packed_src_metadata = std::optional<torch::Tensor>();
+        auto streaming_packed_lane_control = std::optional<torch::Tensor>();
         if (run_streaming_copy) {
             const int64_t raw_lane_route_capacity =
                 static_cast<int64_t>(num_max_tokens_per_rank) * std::min(num_topk, num_local_experts);
@@ -1531,6 +1559,12 @@ public:
                 {static_cast<int64_t>(nccl_context->num_ranks) * num_max_tokens_per_rank,
                  num_topk + 2},
                 torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            // Generation-owned downstream control. This must not alias the
+            // single-slot workspace because ingress may be acknowledged as
+            // soon as packing completes.
+            streaming_packed_lane_control = torch::empty(
+                {nccl_context->num_ranks, 2 + num_local_experts},
+                torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
             launch_dispatch_streaming_copy(
                 buffer, workspace,
@@ -1538,6 +1572,7 @@ public:
                 streaming_packed_sf.has_value() ? streaming_packed_sf->mutable_data_ptr() : nullptr,
                 get_data_ptr<float>(streaming_packed_topk_weights),
                 streaming_packed_src_metadata->data_ptr<int>(),
+                streaming_packed_lane_control->data_ptr<int>(),
                 streaming_sf_token_stride, streaming_sf_hidden_stride,
                 nccl_context->scaleup_rank_idx,
                 current_streaming_generation,
@@ -1557,12 +1592,14 @@ public:
             if (streaming_packed_topk_weights.has_value())
                 streaming_packed_topk_weights->record_stream(streaming_copy_stream);
             streaming_packed_src_metadata->record_stream(streaming_copy_stream);
+            streaming_packed_lane_control->record_stream(streaming_copy_stream);
 
             if (export_streaming_lanes) {
                 latest_streaming_packed_x = streaming_packed_x;
                 latest_streaming_packed_sf = streaming_packed_sf;
                 latest_streaming_packed_topk_weights = streaming_packed_topk_weights;
                 latest_streaming_packed_src_metadata = streaming_packed_src_metadata;
+                latest_streaming_packed_lane_control = streaming_packed_lane_control;
                 latest_streaming_generation = current_streaming_generation;
                 latest_streaming_num_ranks = nccl_context->num_ranks;
                 latest_streaming_num_local_experts = num_local_experts;
@@ -1573,6 +1610,8 @@ public:
                     nccl_context->num_ranks, false);
                 streaming_lane_release_events.clear();
                 streaming_lane_release_events.resize(nccl_context->num_ranks);
+                streaming_lane_return_events.clear();
+                streaming_lane_return_events.resize(nccl_context->num_ranks);
                 streaming_lane_view_outstanding = true;
             }
         }
@@ -1894,6 +1933,7 @@ static void register_apis(pybind11::module_& m) {
         .def("destroy", &ElasticBuffer::destroy)
         .def("get_comm_stream", &ElasticBuffer::get_comm_stream)
         .def("get_streaming_generation", &ElasticBuffer::get_streaming_generation)
+        .def("get_streaming_lane_protocol_version", &ElasticBuffer::get_streaming_lane_protocol_version)
         .def("get_streaming_lane_view", &ElasticBuffer::get_streaming_lane_view)
         .def("release_streaming_lane", &ElasticBuffer::release_streaming_lane)
         .def("release_streaming_lane_view", &ElasticBuffer::release_streaming_lane_view)

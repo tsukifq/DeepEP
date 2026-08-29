@@ -21,7 +21,7 @@ enum class LaneState : uint32_t {
     kPacking = 5,
     kGemmReady = 6,
     kGemmRunning = 7,
-    kGemmDone = 8,
+    kIngressConsumed = 8,
     kAcked = 9,
 };
 
@@ -39,8 +39,8 @@ struct alignas(64) LaneControl {
     uint64_t generation;
     uint64_t payload_done_seq;
     uint64_t pack_done_seq;
-    // The return kernel is the final reader of this generation's ingress
-    // payload/count control.  It publishes this sequence before reuse ACK.
+    // The copy kernel publishes this after snapshotting all ingress-derived
+    // payload and control into generation-owned storage.
     uint64_t ingress_consumed_seq;
     uint64_t ack_seq;
 
@@ -132,7 +132,8 @@ __forceinline__ __device__ bool acquire_pack_ready(
 
 __forceinline__ __device__ void publish_ingress_consumed(
     LaneControl* lane, const uint64_t& generation) {
-    ptx::st_relaxed_sys(&lane->state, static_cast<uint32_t>(LaneState::kGemmDone));
+    ptx::st_relaxed_sys(
+        &lane->state, static_cast<uint32_t>(LaneState::kIngressConsumed));
     ptx::st_release_sys(&lane->ingress_consumed_seq, generation);
 }
 

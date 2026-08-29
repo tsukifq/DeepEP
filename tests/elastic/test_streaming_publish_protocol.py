@@ -79,12 +79,12 @@ def test_streaming_generation_is_exposed_without_advancing_the_baseline():
     assert "return self.runtime.get_streaming_generation()" in python_source
 
 
-def test_per_source_release_waits_for_the_return_kernels_final_ingress_read():
+def test_per_source_release_waits_for_copy_owned_ingress_snapshot():
     control_source = (
         ROOT / "deep_ep/include/deep_ep/common/streaming.cuh"
     ).read_text(encoding="utf-8")
-    return_source = (
-        ROOT / "deep_ep/include/deep_ep/impls/combine_streaming.cuh"
+    copy_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/dispatch_streaming_copy.cuh"
     ).read_text(encoding="utf-8")
     ack_source = (
         ROOT / "deep_ep/include/deep_ep/impls/dispatch_streaming_reuse.cuh"
@@ -94,17 +94,17 @@ def test_per_source_release_waits_for_the_return_kernels_final_ingress_read():
     assert "publish_ingress_consumed" in control_source
     assert "acquire_ingress_consumed" in control_source
 
-    count_read = return_source.index(
-        "const int num_source_tokens = lane_control->num_unique_tokens;"
+    snapshot = copy_source.index(
+        "packed_lane_control[source_rank_idx * (kNumExpertsPerRank + 2) + 0]"
     )
-    return_publish = return_source.index(
-        "streaming::publish_return_ready", count_read
+    pack_ready = copy_source.index(
+        "streaming::publish_pack_ready(lane_control, generation);", snapshot
     )
-    ingress_consumed = return_source.index(
+    ingress_consumed = copy_source.index(
         "streaming::publish_ingress_consumed(lane_control, generation);",
-        return_publish,
+        pack_ready,
     )
-    assert count_read < return_publish < ingress_consumed
+    assert snapshot < pack_ready < ingress_consumed
 
     wait = ack_source.index(
         "streaming::acquire_ingress_consumed(source_lane, generation)"
@@ -114,6 +114,75 @@ def test_per_source_release_waits_for_the_return_kernels_final_ingress_read():
     )
     assert "dispatch_streaming_lane_ack_impl" in ack_source
     assert wait < remote_ack
+
+
+def test_generation_owned_lane_control_replaces_workspace_downstream_reads():
+    host_source = (ROOT / "csrc/elastic/buffer.hpp").read_text(encoding="utf-8")
+    python_source = (ROOT / "deep_ep/buffers/elastic.py").read_text(
+        encoding="utf-8"
+    )
+    copy_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/dispatch_streaming_copy.cuh"
+    ).read_text(encoding="utf-8")
+    return_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/combine_streaming.cuh"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "{nccl_context->num_ranks, 2 + num_local_experts}" in host_source
+    )
+    # Public lane-view stays at seven fields: only the snapshot psum is
+    # exported, while counts remain internal to preserve the original ABI.
+    assert "latest_streaming_packed_lane_control->slice(1, 0, 2)" not in host_source
+    assert (
+        "latest_streaming_packed_lane_control->slice(\n"
+        "                1, 2, 2 + num_local_experts)"
+    ) in host_source
+    assert "int* packed_lane_control" in copy_source
+    assert "get_streaming_lane_psum_ptr" not in copy_source
+
+    assert "const int* lane_counts" in return_source
+    assert "const int num_source_tokens = lane_counts[0];" in return_source
+    assert "const int num_source_routes = lane_counts[1];" in return_source
+    assert "lane_control->num_unique_tokens" not in return_source
+    assert "lane_control->num_routes" not in return_source
+    assert "publish_ingress_consumed" not in return_source
+    assert "torch::Tensor lane_counts," not in host_source
+    assert "const auto lane_counts =" in host_source
+    assert "source_rank_idx * lane_control_stride;" in host_source
+    assert "latest_streaming_packed_lane_control->record_stream(stream);" in host_source
+    assert "lane_counts: torch.Tensor," not in python_source
+    assert (
+        "lane_output, lane_src_metadata, source_rank, generation"
+        in python_source
+    )
+    assert "int get_streaming_lane_protocol_version() const" in host_source
+    assert "return 2;" in host_source
+    assert '.def("get_streaming_lane_protocol_version"' in host_source
+    assert "def get_streaming_lane_protocol_version(self) -> int:" in python_source
+
+
+def test_generation_owned_lane_control_survives_workspace_reuse_semantics():
+    # One logical destination snapshots g before its shared ingress/control is
+    # overwritten by g+1. GEMM and return must continue to observe g.
+    shared_workspace = {
+        "tokens": 5,
+        "routes": 9,
+        "expert_psum": [2, 9],
+        "generation": 7,
+    }
+    generation_control = (
+        shared_workspace["tokens"],
+        shared_workspace["routes"],
+        *shared_workspace["expert_psum"],
+    )
+    shared_workspace.update(
+        tokens=3, routes=4, expert_psum=[1, 4], generation=8
+    )
+
+    assert generation_control[:2] == (5, 9)
+    assert generation_control[2:] == (2, 9)
+    assert shared_workspace["generation"] == 8
 
 
 def test_per_source_release_api_is_generation_checked_and_not_double_acked():
@@ -126,7 +195,7 @@ def test_per_source_release_api_is_generation_checked_and_not_double_acked():
     method_end = host_source.index("void streaming_combine_return(", method)
     method_source = host_source[method:method_end]
     assert "generation == latest_streaming_generation" in method_source
-    assert "streaming_lane_return_submitted[source_rank_idx]" in method_source
+    assert "streaming_lane_return_submitted[source_rank_idx]" not in method_source
     assert "not streaming_lane_ingress_released[source_rank_idx]" in method_source
     assert "launch_dispatch_streaming_lane_ack(" in method_source
     assert "streaming_lane_release_events[source_rank_idx] = EventHandle(stream);" in method_source
@@ -147,7 +216,11 @@ def test_per_source_release_removes_only_the_strict_generation_wide_joins():
     assert "stream, unreleased_source_mask" in finalize_source
     assert "streaming_consumer_event = EventHandle(stream);" in finalize_source
     assert "streaming_generation_released_per_lane = true;" in finalize_source
+    assert "streaming_lane_return_submitted[source_rank_idx]" in finalize_source
+    assert "streaming_lane_return_events[source_rank_idx].has_value()" in finalize_source
+    assert "All per-lane returns must be submitted" in finalize_source
     assert "for (const auto& release_event : streaming_lane_release_events)" in finalize_source
+    assert "for (const auto& return_event : streaming_lane_return_events)" in finalize_source
     assert "streaming_lane_drain_event = EventHandle(stream);" in finalize_source
 
     dispatch_guard = source.index("if (not streaming_generation_released_per_lane)")

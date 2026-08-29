@@ -25,6 +25,7 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
                              void* packed_x, sf_pack_t* packed_sf,
                              float* packed_topk_weights,
                              int* packed_src_metadata,
+                             int* packed_lane_control,
                              const int packed_sf_token_stride,
                              const int packed_sf_hidden_stride,
                              const int destination_rank_idx,
@@ -86,15 +87,20 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
             packed_end = packed_start + count;
             raw_routes += count;
             EP_DEVICE_ASSERT(packed_end <= kLaneRouteCapacity);
-            workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx] =
+            packed_lane_control[
+                source_rank_idx * (kNumExpertsPerRank + 2) + 2 + expert_idx] =
                 static_cast<int>(packed_end);
             lane_expert_cursor[expert_idx] = static_cast<int>(packed_start);
         }
         EP_DEVICE_ASSERT(raw_routes <= kRawLaneRouteCapacity);
-        workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[kNumExpertsPerRank] =
-            static_cast<int>(packed_end);
         lane_num_routes = static_cast<int>(raw_routes);
+        packed_lane_control[source_rank_idx * (kNumExpertsPerRank + 2) + 0] =
+            lane_num_tokens;
+        packed_lane_control[source_rank_idx * (kNumExpertsPerRank + 2) + 1] =
+            lane_num_routes;
         lane_control->generation = generation;
+        // Workspace mirrors are diagnostic only. Downstream consumers own
+        // generation-private count and psum sidecars.
         lane_control->num_unique_tokens = lane_num_tokens;
         lane_control->num_routes = lane_num_routes;
         ptx::st_relaxed_sys(
@@ -213,21 +219,24 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
     __syncthreads();
     if (thread_idx == 0) {
         for (int expert_idx = 0; expert_idx < kNumExpertsPerRank; ++ expert_idx) {
-            if (lane_expert_cursor[expert_idx] !=
-                workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx]) {
+            const auto expected_end = packed_lane_control[
+                source_rank_idx * (kNumExpertsPerRank + 2) + 2 + expert_idx];
+            if (lane_expert_cursor[expert_idx] != expected_end) {
                 printf("DeepEP streaming pack count mismatch, dst: %d, src: %d, generation: %llu, expert: %d, actual end: %d, expected end: %d, tokens: %d, routes: %d\n",
                        destination_rank_idx, source_rank_idx,
                        static_cast<unsigned long long>(generation), expert_idx,
                        lane_expert_cursor[expert_idx],
-                       workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx],
+                       expected_end,
                        lane_num_tokens, lane_num_routes);
             }
-            EP_DEVICE_ASSERT(
-                lane_expert_cursor[expert_idx] ==
-                workspace_layout.get_streaming_lane_psum_ptr(source_rank_idx)[expert_idx]);
+            EP_DEVICE_ASSERT(lane_expert_cursor[expert_idx] == expected_end);
         }
         ptx::fence_acq_rel_sys();
         streaming::publish_pack_ready(lane_control, generation);
+        // The copy CTA is now done with the remote single-slot ingress. The
+        // consumer must observe pack_done on its lane stream before queuing
+        // the ACK that waits on this marker.
+        streaming::publish_ingress_consumed(lane_control, generation);
     }
 }
 

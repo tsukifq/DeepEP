@@ -301,6 +301,7 @@ public:
         int64_t num_timeout_cycles;
         nv_bfloat16* lane_output;
         int* lane_src_metadata;
+        const int* lane_counts;
         int lane_base_row, lane_capacity;
         jit::NoRefPtr nccl_dev_comm;
         ncclWindow_t nccl_window;
@@ -331,7 +332,7 @@ static void __instantiate_kernel() {{
         Args args) {
         EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
             kernel, config,
-            args.lane_output, args.lane_src_metadata,
+            args.lane_output, args.lane_src_metadata, args.lane_counts,
             args.lane_base_row, args.lane_capacity,
             args.nccl_dev_comm, args.nccl_window,
             args.buffer, args.workspace,
@@ -341,7 +342,7 @@ static void __instantiate_kernel() {{
 };
 
 static void launch_streaming_combine_return(
-    void* lane_output, int* lane_src_metadata,
+    void* lane_output, int* lane_src_metadata, const int* lane_counts,
     const int& lane_base_row, const int& lane_capacity,
     const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
     void* buffer, void* workspace,
@@ -368,6 +369,7 @@ static void launch_streaming_combine_return(
         .num_timeout_cycles = num_timeout_cycles,
         .lane_output = static_cast<nv_bfloat16*>(lane_output),
         .lane_src_metadata = lane_src_metadata,
+        .lane_counts = lane_counts,
         .lane_base_row = lane_base_row,
         .lane_capacity = lane_capacity,
         .nccl_dev_comm = nccl_dev_comm,
