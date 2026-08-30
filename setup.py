@@ -145,8 +145,21 @@ if __name__ == '__main__':
         nvcc_flags.extend(['-rdc=true', '--ptxas-options=--register-usage-level=10'])
         # PyTorch does not propagate the regular nvcc architecture flags to
         # its separate RDC device-link command. Without an explicit target,
-        # nvcc defaults that step to sm_52 and drops every sm_90 object.
-        nvcc_dlink.extend(['-gencode=arch=compute_90,code=sm_90'])
+        # nvcc defaults that step to sm_52 and drops every modern code object.
+        # Keep the extension single-target and native: qualification builds
+        # support Hopper SM90 or Blackwell SM100, never an implicit PTX-only
+        # fallback or a mixed architecture list.
+        rdc_arches = {'9.0': '90', '10.0': '100'}
+        torch_cuda_arch = os.environ['TORCH_CUDA_ARCH_LIST'].strip()
+        if torch_cuda_arch not in rdc_arches:
+            raise RuntimeError(
+                'DeepEP RDC build requires one native architecture from '
+                f'{sorted(rdc_arches)}; got {torch_cuda_arch!r}'
+            )
+        rdc_arch = rdc_arches[torch_cuda_arch]
+        nvcc_dlink.extend([
+            f'-gencode=arch=compute_{rdc_arch},code=sm_{rdc_arch}'
+        ])
 
     # Disable LD/ST tricks, as some CUDA version does not support `.L1::no_allocate`
     if os.environ['TORCH_CUDA_ARCH_LIST'].strip() != '9.0':

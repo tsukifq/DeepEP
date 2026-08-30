@@ -349,7 +349,9 @@ def test_streaming_copy_lifecycle_joins_every_source_without_changing_rank_ready
     assert "if (run_streaming_copy)\n            streaming_lane_copy_used = true;" in source
 
 
-def test_sm90_rdc_device_link_keeps_the_target_architecture():
+def test_rdc_device_link_keeps_hopper_or_blackwell_native_architecture():
     source = (ROOT / "setup.py").read_text(encoding="utf-8")
 
-    assert "nvcc_dlink.extend(['-gencode=arch=compute_90,code=sm_90'])" in source
+    assert "rdc_arches = {'9.0': '90', '10.0': '100'}" in source
+    assert "if torch_cuda_arch not in rdc_arches:" in source
+    assert "f'-gencode=arch=compute_{rdc_arch},code=sm_{rdc_arch}'" in source
