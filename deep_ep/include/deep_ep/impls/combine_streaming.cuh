@@ -37,7 +37,6 @@ combine_streaming_return_impl(
     const int destination_rank_idx,
     const uint64_t generation) {
     EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
-    EP_STATIC_ASSERT(kNumRanks <= kNumTopk, "Streaming return requires rank layout");
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
@@ -177,7 +176,6 @@ combine_streaming_reduce_impl(
     const int source_rank_idx,
     const int num_combined_tokens,
     const uint64_t generation) {
-    EP_STATIC_ASSERT(kNumRanks <= kNumTopk, "Streaming reduce requires rank layout");
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();

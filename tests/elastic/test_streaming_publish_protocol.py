@@ -278,7 +278,7 @@ def test_streaming_copy_launches_one_runtime_selected_source_per_stream():
     assert "source_streams[source_rank_idx]" in launch_source
 
 
-def test_streaming_copy_owns_fixed_source_streams_and_all_tensor_lifetimes():
+def test_streaming_copy_owns_stable_source_stream_slots_and_tensor_lifetimes():
     source = (ROOT / "csrc/elastic/buffer.hpp").read_text(encoding="utf-8")
 
     assert (
@@ -292,11 +292,10 @@ def test_streaming_copy_owns_fixed_source_streams_and_all_tensor_lifetimes():
         "streaming_lane_copy_streams.reserve(nccl_context->num_ranks);"
         in constructor_source
     )
-    assert (
-        "streaming_lane_copy_streams.emplace_back(\n"
-        "                at::cuda::getStreamFromPool(false));"
-        in constructor_source
-    )
+    assert "const auto shared_lane_copy_stream" in constructor_source
+    assert "EP_STREAMING_SERIALIZE_LANE_COPIES" in constructor_source
+    assert "serialize_lane_copies ? shared_lane_copy_stream" in constructor_source
+    assert ": at::cuda::getStreamFromPool(false)" in constructor_source
 
     launch = source.index("launch_dispatch_streaming_copy(")
     records = source.index(

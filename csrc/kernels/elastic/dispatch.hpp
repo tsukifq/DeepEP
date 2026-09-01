@@ -510,7 +510,8 @@ public:
         float* packed_topk_weights;
         int* packed_src_metadata;
         int* packed_lane_control;
-        int packed_sf_token_stride, packed_sf_hidden_stride;
+        int packed_sf_lane_stride, packed_sf_token_stride;
+        int packed_sf_hidden_stride;
         int destination_rank_idx, source_rank_idx;
         uint64_t generation;
 
@@ -542,6 +543,7 @@ static void __instantiate_kernel() {{
             args.packed_topk_weights,
             args.packed_src_metadata,
             args.packed_lane_control,
+            args.packed_sf_lane_stride,
             args.packed_sf_token_stride, args.packed_sf_hidden_stride,
             args.destination_rank_idx, args.source_rank_idx,
             args.generation));
@@ -554,6 +556,7 @@ static void launch_dispatch_streaming_copy(
     float* packed_topk_weights,
     int* packed_src_metadata,
     int* packed_lane_control,
+    const int& packed_sf_lane_stride,
     const int& packed_sf_token_stride, const int& packed_sf_hidden_stride,
     const int& destination_rank_idx,
     const uint64_t& generation,
@@ -584,6 +587,7 @@ static void launch_dispatch_streaming_copy(
         .packed_topk_weights = packed_topk_weights,
         .packed_src_metadata = packed_src_metadata,
         .packed_lane_control = packed_lane_control,
+        .packed_sf_lane_stride = packed_sf_lane_stride,
         .packed_sf_token_stride = packed_sf_token_stride,
         .packed_sf_hidden_stride = packed_sf_hidden_stride,
         .destination_rank_idx = destination_rank_idx,

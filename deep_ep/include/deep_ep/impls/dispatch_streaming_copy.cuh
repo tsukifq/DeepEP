@@ -26,6 +26,7 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
                              float* packed_topk_weights,
                              int* packed_src_metadata,
                              int* packed_lane_control,
+                             const int packed_sf_lane_stride,
                              const int packed_sf_token_stride,
                              const int packed_sf_hidden_stride,
                              const int destination_rank_idx,
@@ -185,10 +186,17 @@ dispatch_streaming_copy_impl(void* buffer, void* workspace,
             auto mask = ptx::gather(dst_tensor_idx >= 0);
             while (mask) {
                 const int valid_lane_idx = __ffs(mask) - 1;
+                const int valid_dst_tensor_idx =
+                    ptx::exchange(dst_tensor_idx, valid_lane_idx);
+                const int valid_lane_row = valid_dst_tensor_idx -
+                    source_rank_idx * kLaneRouteCapacity;
                 const auto gmem_dst = math::advance_ptr<sf_pack_t>(
                     packed_sf,
-                    ptx::exchange(dst_tensor_idx, valid_lane_idx) *
-                        (static_cast<int64_t>(packed_sf_token_stride) * sizeof(sf_pack_t)));
+                    (static_cast<int64_t>(source_rank_idx) *
+                         packed_sf_lane_stride +
+                     static_cast<int64_t>(valid_lane_row) *
+                         packed_sf_token_stride) *
+                        sizeof(sf_pack_t));
                 #pragma unroll
                 for (int k = 0; k < kNumFullIters; ++ k)
                     gmem_dst[(k * 32 + lane_idx) * static_cast<int64_t>(packed_sf_hidden_stride)] = reg_src[k];

@@ -140,15 +140,19 @@ public:
             num_sym_bytes, num_cpu_buffer_bytes,
             allow_hybrid_mode, sl_idx, num_allocated_qps);
 
-        // Allocate these once so source s always reuses the same stream. CUDA
-        // stream FIFO gives generations of one source strict order, while
-        // distinct sources can make progress independently.
+        // Source lanes own disjoint payload and doorbell slices, so keep their
+        // ingress producers concurrent. A diagnostic fallback can serialize them
+        // without changing the protocol if a platform-specific driver issue recurs.
         streaming_lane_copy_streams.reserve(nccl_context->num_ranks);
+        const auto serialize_lane_copies =
+            get_env<int>("EP_STREAMING_SERIALIZE_LANE_COPIES", 0) != 0;
+        const auto shared_lane_copy_stream = at::cuda::getStreamFromPool(false);
         for (int source_rank_idx = 0;
              source_rank_idx < nccl_context->num_ranks;
              ++ source_rank_idx) {
             streaming_lane_copy_streams.emplace_back(
-                at::cuda::getStreamFromPool(false));
+                serialize_lane_copies ? shared_lane_copy_stream
+                                      : at::cuda::getStreamFromPool(false));
         }
 
         // Verify the symmetric memory layout matches our expectations
@@ -252,12 +256,10 @@ public:
         auto lane_sf = std::optional<torch::Tensor>();
         if (latest_streaming_packed_sf.has_value()) {
             const auto& packed_sf = latest_streaming_packed_sf.value();
-            EP_HOST_ASSERT(packed_sf.dim() == 2 and
-                           packed_sf.size(0) == num_ranks * lane_capacity);
-            lane_sf = packed_sf.as_strided(
-                {num_ranks, lane_capacity, packed_sf.size(1)},
-                {lane_capacity * packed_sf.stride(0),
-                 packed_sf.stride(0), packed_sf.stride(1)});
+            EP_HOST_ASSERT(packed_sf.dim() == 3 and
+                           packed_sf.size(0) == num_ranks and
+                           packed_sf.size(1) == lane_capacity);
+            lane_sf = packed_sf;
         }
         return {
             latest_streaming_packed_x->view(
@@ -940,7 +942,13 @@ public:
 
         if (num_scaleout_ranks == 1) {
             // Direct combine
-            const auto num_tokens_in_layout = allow_multiple_reduction ? std::min(num_ranks, num_topk) : num_topk;
+            // Streaming return addresses one slot per destination rank.  The
+            // regular multiple-reduction layout needs only min(ranks, top-k),
+            // which is too small for EP8 models whose router top-k is smaller.
+            const auto num_tokens_in_layout =
+                get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0
+                    ? num_ranks
+                    : (allow_multiple_reduction ? std::min(num_ranks, num_topk) : num_topk);
             const auto send_buffer_layout = layout::BufferLayout<false>(
                 token_layout, is_scaleup_nvlink ? 0 : num_ranks,
                 // For single reduction cases, the maximum number of received tokens is
@@ -1387,6 +1395,15 @@ public:
                 // below.  Joining this destination's unrelated lane streams
                 // here would recreate an implicit rank barrier.
                 EP_HOST_ASSERT(not streaming_consumer_event.has_value());
+                // The caller can enqueue the next model layer before the
+                // current stream's source-reduce wait has retired.  On SM100,
+                // allowing that next dispatch to reuse the shared symmetric
+                // ingress while lane GEMMs/returns are still outstanding can
+                // race the device-side reuse protocol.  Preserve asynchronous
+                // work within a generation, but fence generation reuse on the
+                // accumulated lane lifetime event.
+                if (streaming_lane_drain_event.has_value())
+                    stream_wait(comm_stream, streaming_lane_drain_event.value());
             }
             streaming_generation_released_per_lane = false;
         }
@@ -1561,19 +1578,25 @@ public:
             streaming_packed_x = torch::empty(
                 {num_streaming_packed_tokens, hidden}, x.options());
 
+            int streaming_sf_lane_stride = 0;
             int streaming_sf_token_stride = 0, streaming_sf_hidden_stride = 0;
             if (sf.has_value()) {
                 if (not use_tma_aligned_col_major_sf) {
                     streaming_sf_token_stride = num_sf_packs;
                     streaming_sf_hidden_stride = 1;
+                    streaming_sf_lane_stride =
+                        lane_route_capacity * num_sf_packs;
                 } else {
                     streaming_sf_token_stride = 1;
                     streaming_sf_hidden_stride = math::align(
-                        static_cast<int>(num_streaming_packed_tokens), kNumAlignedSFPacks);
+                        static_cast<int>(lane_route_capacity), kNumAlignedSFPacks);
+                    streaming_sf_lane_stride =
+                        streaming_sf_hidden_stride * num_sf_packs;
                 }
                 streaming_packed_sf = torch::empty_strided(
-                    {num_streaming_packed_tokens, num_sf_packs},
-                    {streaming_sf_token_stride, streaming_sf_hidden_stride},
+                    {nccl_context->num_ranks, lane_route_capacity, num_sf_packs},
+                    {streaming_sf_lane_stride, streaming_sf_token_stride,
+                     streaming_sf_hidden_stride},
                     sf->options());
             }
             if (topk_weights.has_value()) {
@@ -1598,6 +1621,7 @@ public:
                 get_data_ptr<float>(streaming_packed_topk_weights),
                 streaming_packed_src_metadata->data_ptr<int>(),
                 streaming_packed_lane_control->data_ptr<int>(),
+                streaming_sf_lane_stride,
                 streaming_sf_token_stride, streaming_sf_hidden_stride,
                 nccl_context->scaleup_rank_idx,
                 current_streaming_generation,
