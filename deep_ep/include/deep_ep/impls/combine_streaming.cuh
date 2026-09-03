@@ -80,15 +80,33 @@ combine_streaming_return_impl(
     }
     __syncthreads();
 
-    const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
-    if (ptx::elect_one_sync())
-        ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
-    __syncwarp();
-
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<1, kNumQPs, kNumWarps>(0, warp_idx);
     const auto gin = handle::NCCLGin(
         nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+
+    // A zero-route lane must still publish its generation so the source-side
+    // reduce can make progress.  Avoid scanning every source token and
+    // setting up the TMA/NVLink data path when there is nothing to return.
+    if (num_source_routes == 0) {
+        if (thread_idx == 0) {
+            ptx::fence_acq_rel_sys();
+            auto* local_control =
+                workspace_layout.get_streaming_return_control_ptr(
+                    destination_rank_idx);
+            auto* remote_control = gin.get_sym_ptr<ncclTeamTagLsa>(
+                local_control, source_rank_idx);
+            EP_DEVICE_ASSERT(remote_control != nullptr);
+            ptx::st_relaxed_sys(&remote_control->generation, generation);
+            streaming::publish_return_ready(remote_control, generation, 0);
+        }
+        return;
+    }
+
+    const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
+    if (ptx::elect_one_sync())
+        ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
+    __syncwarp();
 
     constexpr int kMetadataStride = 2 + kNumTopk;
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;

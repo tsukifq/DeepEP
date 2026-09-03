@@ -206,6 +206,20 @@ def test_per_source_release_api_is_generation_checked_and_not_double_acked():
     assert "self.runtime.release_streaming_lane(source_rank, generation)" in python_source
 
 
+def test_zero_route_return_publishes_completion_without_scanning_tokens():
+    source = (
+        ROOT / "deep_ep/include/deep_ep/impls/combine_streaming.cuh"
+    ).read_text(encoding="utf-8")
+
+    one_lane = source.index("combine_streaming_return_impl(")
+    reduce_kernel = source.index("combine_streaming_reduce_impl(", one_lane)
+    one_lane_source = source[one_lane:reduce_kernel]
+    empty = one_lane_source.index("if (num_source_routes == 0)")
+    token_loop = one_lane_source.index("for (int token_idx = warp_idx;")
+    assert empty < token_loop
+    assert "publish_return_ready(remote_control, generation, 0)" in one_lane_source
+
+
 def test_per_source_release_removes_only_the_strict_generation_wide_joins():
     source = (ROOT / "csrc/elastic/buffer.hpp").read_text(encoding="utf-8")
 
