@@ -90,6 +90,18 @@ struct alignas(64) ReturnControl {
 static_assert(sizeof(ReturnControl) == 64, "ReturnControl must occupy one cache line");
 static_assert(alignof(ReturnControl) == 64, "ReturnControl must be cache-line aligned");
 
+// Destination-local grid synchronization for one source return. This cannot
+// share ReturnControl: those entries are symmetric doorbells owned by the
+// corresponding source rank and may be updated remotely.
+struct alignas(16) ReturnLaunchControl {
+    uint64_t generation;
+    uint32_t completed_blocks;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(ReturnLaunchControl) == 16,
+              "Invalid ReturnLaunchControl layout");
+
 struct alignas(64) LayerControl {
     uint64_t generation;
     uint64_t attention_done_seq;
@@ -101,7 +113,11 @@ struct alignas(64) LayerControl {
     uint32_t acknowledged_returns;
     uint32_t error;
 
-    uint64_t reserved[2];
+    // Generation-tagged grid completion for the sharded source reduction.
+    // Only one reduce generation is active per source workspace.
+    uint64_t reduce_generation;
+    uint32_t reduce_completed_blocks;
+    uint32_t reserved;
 };
 
 static_assert(sizeof(LayerControl) == 64, "LayerControl must occupy one cache line");

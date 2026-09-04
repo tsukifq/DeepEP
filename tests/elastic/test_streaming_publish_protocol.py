@@ -215,9 +215,65 @@ def test_zero_route_return_publishes_completion_without_scanning_tokens():
     reduce_kernel = source.index("combine_streaming_reduce_impl(", one_lane)
     one_lane_source = source[one_lane:reduce_kernel]
     empty = one_lane_source.index("if (num_source_routes == 0)")
-    token_loop = one_lane_source.index("for (int token_idx = warp_idx;")
+    token_loop = one_lane_source.index(
+        "for (int token_idx = static_cast<int>(blockIdx.x) * kNumWarps"
+    )
     assert empty < token_loop
     assert "publish_return_ready(remote_control, generation, 0)" in one_lane_source
+
+
+def test_streaming_reduce_shards_tokens_and_last_cta_publishes():
+    control_source = (
+        ROOT / "deep_ep/include/deep_ep/common/streaming.cuh"
+    ).read_text(encoding="utf-8")
+    device_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/combine_streaming.cuh"
+    ).read_text(encoding="utf-8")
+    host_source = (ROOT / "csrc/kernels/elastic/combine.hpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "uint64_t reduce_generation;" in control_source
+    assert "uint32_t reduce_completed_blocks;" in control_source
+    assert "template <int kNumBlocks," in device_source
+    assert "static_cast<int>(blockIdx.x) * kNumWarps + warp_idx" in device_source
+    assert "token_idx += kNumBlocks * kNumWarps" in device_source
+    assert "atomicAdd(&layer_control->reduce_completed_blocks, 1u)" in device_source
+    assert "if (not is_last_block)" in device_source
+    assert '"EP_STREAMING_COMBINE_REDUCE_BLOCKS", 4' in host_source
+    assert ".num_blocks = num_blocks" in host_source
+    assert "num_blocks, kNumWarps * 32, num_smem_bytes" in host_source
+
+
+def test_streaming_return_shards_tokens_and_publishes_from_last_cta():
+    control_source = (
+        ROOT / "deep_ep/include/deep_ep/common/streaming.cuh"
+    ).read_text(encoding="utf-8")
+    layout_source = (
+        ROOT / "deep_ep/include/deep_ep/common/layout.cuh"
+    ).read_text(encoding="utf-8")
+    device_source = (
+        ROOT / "deep_ep/include/deep_ep/impls/combine_streaming.cuh"
+    ).read_text(encoding="utf-8")
+    host_source = (ROOT / "csrc/kernels/elastic/combine.hpp").read_text(
+        encoding="utf-8"
+    )
+
+    assert "struct alignas(16) ReturnLaunchControl" in control_source
+    assert "uint32_t completed_blocks;" in control_source
+    assert "get_streaming_return_launch_control_ptr" in layout_source
+    return_start = device_source.index("combine_streaming_return_impl(")
+    reduce_start = device_source.index("combine_streaming_reduce_impl(", return_start)
+    return_source = device_source[return_start:reduce_start]
+    assert "blockIdx.x) * kNumWarps + warp_idx" in return_source
+    assert "token_idx += kNumBlocks * kNumWarps" in return_source
+    assert "atomicAdd(&launch_control->completed_blocks, 1u)" in return_source
+    assert "if (not is_last_block)" in return_source
+    assert "thread_idx == 0 and blockIdx.x == 0" in return_source
+    assert "kNumRanks * kNumBlocks, kNumQPs" in return_source
+    assert '"EP_STREAMING_COMBINE_RETURN_BLOCKS"' in host_source
+    assert ".num_blocks = num_blocks" in host_source
+    assert "num_blocks, kNumWarps * 32, num_smem_bytes" in host_source
 
 
 def test_per_source_release_removes_only_the_strict_generation_wide_joins():

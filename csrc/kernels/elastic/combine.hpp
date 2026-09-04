@@ -296,7 +296,7 @@ class StreamingCombineReturnRuntime final :
     public jit::LaunchRuntime<StreamingCombineReturnRuntime> {
 public:
     struct Args {
-        int num_warps, num_ranks, hidden, num_max_tokens_per_rank;
+        int num_blocks, num_warps, num_ranks, hidden, num_max_tokens_per_rank;
         int num_experts, num_topk, num_qps;
         int64_t num_timeout_cycles;
         nv_bfloat16* lane_output;
@@ -319,9 +319,9 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)",          args.num_warps, args.num_ranks, args.hidden,
+)",          args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
              args.num_max_tokens_per_rank, args.num_experts, args.num_topk,
              args.num_qps, args.num_timeout_cycles);
     }
@@ -353,12 +353,19 @@ static void launch_streaming_combine_return(
     const int& num_experts, const int& num_topk, const int& num_qps,
     const int64_t& num_timeout_cycles,
     const at::cuda::CUDAStream& stream) {
+    const int default_num_blocks =
+        num_qps >= 4 * num_ranks ? 4 :
+        (num_qps >= 2 * num_ranks ? 2 : 1);
+    const int num_blocks = get_env<int>(
+        "EP_STREAMING_COMBINE_RETURN_BLOCKS", default_num_blocks);
+    EP_HOST_ASSERT(1 <= num_blocks and num_blocks <= 8);
     constexpr int kNumWarps = 4;
     const auto token_layout = layout::TokenLayout(
         hidden * sizeof(nv_bfloat16), 0, num_topk, false);
     const auto num_smem_bytes =
         kNumWarps * token_layout.get_num_bytes<true>();
     const StreamingCombineReturnRuntime::Args args = {
+        .num_blocks = num_blocks,
         .num_warps = kNumWarps,
         .num_ranks = num_ranks,
         .hidden = hidden,
@@ -379,7 +386,8 @@ static void launch_streaming_combine_return(
         .source_rank_idx = source_rank_idx,
         .destination_rank_idx = destination_rank_idx,
         .generation = generation,
-        .launch_args = jit::LaunchArgs(1, kNumWarps * 32, num_smem_bytes),
+        .launch_args = jit::LaunchArgs(
+            num_blocks, kNumWarps * 32, num_smem_bytes),
     };
     const auto runtime = jit::compiler->build(
         "streaming_combine_return", StreamingCombineReturnRuntime::generate(args));
@@ -390,7 +398,7 @@ class StreamingCombineReduceRuntime final :
     public jit::LaunchRuntime<StreamingCombineReduceRuntime> {
 public:
     struct Args {
-        int num_warps, num_ranks, hidden, num_max_tokens_per_rank;
+        int num_blocks, num_warps, num_ranks, hidden, num_max_tokens_per_rank;
         int num_experts, num_topk;
         nv_bfloat16* combined_x;
         topk_idx_t* combined_topk_idx;
@@ -411,9 +419,9 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_streaming_reduce_impl<{}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_reduce_impl<{}, {}, {}, {}, {}, {}, {}>);
 }}
-)",          args.num_warps, args.num_ranks, args.hidden,
+)",          args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
              args.num_max_tokens_per_rank, args.num_experts, args.num_topk);
     }
 
@@ -441,12 +449,16 @@ static void launch_streaming_combine_reduce(
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const at::cuda::CUDAStream& stream) {
+    const int num_blocks = get_env<int>(
+        "EP_STREAMING_COMBINE_REDUCE_BLOCKS", 4);
+    EP_HOST_ASSERT(1 <= num_blocks and num_blocks <= 16);
     constexpr int kNumWarps = 4;
     const auto output_layout = layout::TokenLayout(
         hidden * sizeof(nv_bfloat16), 0, 0, false);
     const auto num_smem_bytes =
         kNumWarps * output_layout.get_num_bytes<false>();
     const StreamingCombineReduceRuntime::Args args = {
+        .num_blocks = num_blocks,
         .num_warps = kNumWarps,
         .num_ranks = num_ranks,
         .hidden = hidden,
@@ -462,7 +474,8 @@ static void launch_streaming_combine_reduce(
         .source_rank_idx = source_rank_idx,
         .num_combined_tokens = num_combined_tokens,
         .generation = generation,
-        .launch_args = jit::LaunchArgs(1, kNumWarps * 32, num_smem_bytes),
+        .launch_args = jit::LaunchArgs(
+            num_blocks, kNumWarps * 32, num_smem_bytes),
     };
     const auto runtime = jit::compiler->build(
         "streaming_combine_reduce", StreamingCombineReduceRuntime::generate(args));

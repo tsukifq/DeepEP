@@ -11,11 +11,11 @@
 
 namespace deep_ep::elastic {
 
-// Functional single-CTA return path for one ready (source, destination)
-// route batch. It has no all-rank barrier and publishes only the source's
-// destination-indexed return doorbell. The performance path will shard this
-// work into expert tiles and use a device queue.
-template <int kNumWarps,
+// Return path for one ready (source, destination) route batch. Token rows are
+// sharded across a small grid, without an all-rank barrier. The last CTA
+// publishes only the source's destination-indexed return doorbell.
+template <int kNumBlocks,
+          int kNumWarps,
           int kNumRanks,
           int kHidden,
           int kNumMaxTokensPerRank,
@@ -40,7 +40,7 @@ combine_streaming_return_impl(
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
-    EP_DEVICE_ASSERT(blockIdx.x == 0);
+    EP_DEVICE_ASSERT(blockIdx.x < kNumBlocks);
     EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);
     EP_DEVICE_ASSERT(0 <= destination_rank_idx and destination_rank_idx < kNumRanks);
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
@@ -60,28 +60,42 @@ combine_streaming_return_impl(
                      num_source_tokens <= kNumMaxTokensPerRank);
     EP_DEVICE_ASSERT(num_source_routes >= 0);
 
-    // The return buffer is single-slot per (source, destination).  Wait only
-    // for this source's previous reduction acknowledgement before reusing it.
-    if (thread_idx == 0 and generation > 1) {
-        const auto* ack_control =
-            workspace_layout.get_streaming_return_control_ptr(source_rank_idx);
-        comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-            if (streaming::acquire_return_ack(ack_control, generation - 1))
-                return true;
-            if (is_last_check) {
-                printf("DeepEP streaming return reuse timeout, dst: %d, src: %d, expected generation: %llu, observed: %llu\n",
-                       destination_rank_idx, source_rank_idx,
-                       static_cast<unsigned long long>(generation - 1),
-                       static_cast<unsigned long long>(
-                           ptx::ld_acquire_sys(&ack_control->ack_seq)));
+    // The return buffer is single-slot per (source, destination). Block zero
+    // waits for this source's previous reduction acknowledgement, initializes
+    // destination-local grid completion, then releases the remaining CTAs.
+    auto* launch_control =
+        workspace_layout.get_streaming_return_launch_control_ptr(source_rank_idx);
+    if (thread_idx == 0) {
+        if (blockIdx.x == 0) {
+            if (generation > 1) {
+                const auto* ack_control =
+                    workspace_layout.get_streaming_return_control_ptr(source_rank_idx);
+                comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+                    if (streaming::acquire_return_ack(ack_control, generation - 1))
+                        return true;
+                    if (is_last_check) {
+                        printf("DeepEP streaming return reuse timeout, dst: %d, src: %d, expected generation: %llu, observed: %llu\n",
+                               destination_rank_idx, source_rank_idx,
+                               static_cast<unsigned long long>(generation - 1),
+                               static_cast<unsigned long long>(
+                                   ptx::ld_acquire_sys(&ack_control->ack_seq)));
+                    }
+                    return false;
+                });
             }
-            return false;
-        });
+            ptx::st_relaxed_sys(&launch_control->completed_blocks, 0u);
+            ptx::st_release_sys(&launch_control->generation, generation);
+        } else {
+            while (ptx::ld_acquire_sys(&launch_control->generation) != generation) {}
+        }
     }
     __syncthreads();
 
+    // Give each concurrent source/block CTA a distinct virtual SM/QP whenever
+    // enough QPs exist. get_qp_mode safely falls back to GPU sharing otherwise.
     const auto [qp_idx, sharing_mode] =
-        comm::get_qp_mode<1, kNumQPs, kNumWarps>(0, warp_idx);
+        comm::get_qp_mode<kNumRanks * kNumBlocks, kNumQPs, kNumWarps>(
+            source_rank_idx * kNumBlocks + static_cast<int>(blockIdx.x), warp_idx);
     const auto gin = handle::NCCLGin(
         nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
@@ -89,7 +103,7 @@ combine_streaming_return_impl(
     // reduce can make progress.  Avoid scanning every source token and
     // setting up the TMA/NVLink data path when there is nothing to return.
     if (num_source_routes == 0) {
-        if (thread_idx == 0) {
+        if (thread_idx == 0 and blockIdx.x == 0) {
             ptx::fence_acq_rel_sys();
             auto* local_control =
                 workspace_layout.get_streaming_return_control_ptr(
@@ -112,9 +126,9 @@ combine_streaming_return_impl(
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-    for (int token_idx = warp_idx;
+    for (int token_idx = static_cast<int>(blockIdx.x) * kNumWarps + warp_idx;
          token_idx < num_source_tokens;
-         token_idx += kNumWarps) {
+         token_idx += kNumBlocks * kNumWarps) {
         const auto metadata = lane_src_metadata + token_idx * kMetadataStride;
         const int source_token_idx = __ldg(metadata) % kNumMaxTokensPerRank;
         int stored_row = lane_idx < kNumTopk ? __ldg(metadata + 2 + lane_idx) : -1;
@@ -161,6 +175,17 @@ combine_streaming_return_impl(
 
     ptx::tma_store_wait();
     __syncthreads();
+
+    __shared__ bool is_last_block;
+    if (thread_idx == 0) {
+        ptx::fence_acq_rel_sys();
+        is_last_block =
+            atomicAdd(&launch_control->completed_blocks, 1u) + 1u == kNumBlocks;
+    }
+    __syncthreads();
+    if (not is_last_block)
+        return;
+
     if (thread_idx == 0) {
         ptx::fence_acq_rel_sys();
         auto* local_control = workspace_layout.get_streaming_return_control_ptr(
@@ -174,10 +199,11 @@ combine_streaming_return_impl(
 }
 
 // Source-local reduction waits for this source's destination returns only.
-// One CTA is intentional in the functional milestone: source_done_seq can be
-// released without a grid-wide dependency. Expert-tile scheduling replaces
-// this kernel before performance evaluation.
-template <int kNumWarps,
+// Token rows are sharded over a small grid. A generation-tagged completion
+// counter lets the last CTA publish source completion without a cooperative
+// launch or a second kernel.
+template <int kNumBlocks,
+          int kNumWarps,
           int kNumRanks,
           int kHidden,
           int kNumMaxTokensPerRank,
@@ -197,16 +223,24 @@ combine_streaming_reduce_impl(
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
-    EP_DEVICE_ASSERT(blockIdx.x == 0);
+    EP_DEVICE_ASSERT(blockIdx.x < kNumBlocks);
     EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);
 
     const auto workspace_layout = layout::WorkspaceLayout(
         workspace, 1, kNumRanks, kNumExperts);
+    auto* layer_control = workspace_layout.get_streaming_layer_control_ptr();
     if (thread_idx == 0) {
-        for (int destination = 0; destination < kNumRanks; ++ destination) {
-            const auto* control =
-                workspace_layout.get_streaming_return_control_ptr(destination);
-            while (not streaming::acquire_return_ready(control, generation)) {}
+        if (blockIdx.x == 0) {
+            for (int destination = 0; destination < kNumRanks; ++ destination) {
+                const auto* control =
+                    workspace_layout.get_streaming_return_control_ptr(destination);
+                while (not streaming::acquire_return_ready(control, generation)) {}
+            }
+            ptx::st_relaxed_sys(&layer_control->reduce_completed_blocks, 0u);
+            ptx::st_release_sys(&layer_control->reduce_generation, generation);
+        } else {
+            while (ptx::ld_acquire_sys(&layer_control->reduce_generation) !=
+                   generation) {}
         }
     }
     __syncthreads();
@@ -226,9 +260,9 @@ combine_streaming_reduce_impl(
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
-    for (int token_idx = warp_idx;
+    for (int token_idx = static_cast<int>(blockIdx.x) * kNumWarps + warp_idx;
          token_idx < num_combined_tokens;
-         token_idx += kNumWarps) {
+         token_idx += kNumBlocks * kNumWarps) {
         int destination = -1;
         if (lane_idx < kNumTopk) {
             const int expert = static_cast<int>(
@@ -269,13 +303,24 @@ combine_streaming_reduce_impl(
 
     ptx::tma_store_wait();
     __syncthreads();
+
+    __shared__ bool is_last_block;
+    if (thread_idx == 0) {
+        ptx::fence_acq_rel_sys();
+        is_last_block =
+            atomicAdd(&layer_control->reduce_completed_blocks, 1u) + 1u ==
+            kNumBlocks;
+    }
+    __syncthreads();
+    if (not is_last_block)
+        return;
+
     if (thread_idx == 0) {
         for (int destination = 0; destination < kNumRanks; ++ destination) {
             auto* control =
                 workspace_layout.get_streaming_return_control_ptr(destination);
             streaming::publish_combine_done(control, generation);
         }
-        auto* layer_control = workspace_layout.get_streaming_layer_control_ptr();
         streaming::publish_source_done(layer_control, generation);
         ptx::st_release_sys(&layer_control->drain_done_seq, generation);
     }

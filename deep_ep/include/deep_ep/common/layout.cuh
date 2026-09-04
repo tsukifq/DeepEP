@@ -88,11 +88,13 @@ struct WorkspaceLayout {
         num_bytes += sizeof(streaming::DispatchSync);
 
         // Streaming return: destination-indexed controls on each source rank,
-        // plus one source-local layer completion line.
+        // one source-local layer completion line, and destination-local
+        // per-source return-grid controls.
         num_bytes = math::align(
             num_bytes, static_cast<int64_t>(alignof(streaming::ReturnControl)));
         num_bytes += kNumMaxRanks * sizeof(streaming::ReturnControl);
         num_bytes += sizeof(streaming::LayerControl);
+        num_bytes += kNumMaxRanks * sizeof(streaming::ReturnLaunchControl);
 
         return num_bytes;
     }
@@ -246,6 +248,14 @@ struct WorkspaceLayout {
         return math::advance_ptr<streaming::LayerControl>(
             get_streaming_return_control_ptr(0),
             kNumMaxRanks * sizeof(streaming::ReturnControl));
+    }
+
+    __forceinline__ __device__ __host__ streaming::ReturnLaunchControl*
+    get_streaming_return_launch_control_ptr(
+        const int& source_rank_idx = 0) const {
+        return math::advance_ptr<streaming::ReturnLaunchControl>(
+            get_streaming_layer_control_ptr(), sizeof(streaming::LayerControl)) +
+            source_rank_idx;
     }
 
     // Consumer-produced DeepGEMM psum end offsets. Entry i is the exclusive
