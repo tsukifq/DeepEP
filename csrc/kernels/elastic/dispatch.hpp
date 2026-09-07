@@ -566,12 +566,15 @@ static void launch_dispatch_streaming_copy(
     const int& num_experts, const int& num_topk,
     const int& num_smem_bytes,
     const int64_t& num_timeout_cycles,
+    const int& requested_num_warps,
     const std::vector<at::cuda::CUDAStream>& source_streams) {
     EP_HOST_ASSERT(source_streams.size() == static_cast<size_t>(num_ranks));
     const auto token_layout = layout::TokenLayout(
         num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    EP_HOST_ASSERT(requested_num_warps > 0);
     const auto num_warps = std::min(
-        num_smem_bytes / token_layout.get_num_bytes<true>(), 2);
+        num_smem_bytes / token_layout.get_num_bytes<true>(),
+        requested_num_warps);
     EP_HOST_ASSERT(num_warps > 0);
     const auto streaming_smem_bytes = num_warps * token_layout.get_num_bytes<true>();
 

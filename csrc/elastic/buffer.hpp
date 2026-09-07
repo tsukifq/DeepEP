@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -425,12 +426,76 @@ public:
             latest_streaming_num_ranks * latest_streaming_num_local_experts,
             num_topk, nccl_context->num_allocated_qps,
             num_gpu_timeout_cycles,
+            false,
             stream);
         lane_output.record_stream(stream);
         lane_src_metadata.record_stream(stream);
         latest_streaming_packed_lane_control->record_stream(stream);
         streaming_lane_return_events[source_rank_idx] = EventHandle(stream);
         streaming_lane_return_submitted[source_rank_idx] = true;
+    }
+
+    void streaming_combine_return_many(
+        torch::Tensor lane_output,
+        torch::Tensor src_metadata,
+        const uint64_t& generation) const {
+        EP_HOST_ASSERT(get_env<int>("EP_EXPERIMENTAL_STREAMING_LAYER") != 0 and
+                       "Streaming layer return is disabled");
+        EP_HOST_ASSERT(streaming_lane_view_outstanding and
+                       latest_streaming_packed_x.has_value() and
+                       latest_streaming_packed_lane_control.has_value());
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1 and
+                       nccl_context->is_scaleup_nvlink and
+                       "Streaming layer return requires one NVLink scale-up domain");
+        EP_HOST_ASSERT(generation == latest_streaming_generation);
+        EP_HOST_ASSERT(latest_streaming_return_buffer != nullptr);
+        EP_HOST_ASSERT(streaming_lane_return_submitted.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_ingress_released.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks) and
+                       streaming_lane_return_events.size() ==
+                           static_cast<size_t>(latest_streaming_num_ranks));
+        EP_HOST_ASSERT(std::none_of(streaming_lane_return_submitted.begin(),
+                                   streaming_lane_return_submitted.end(),
+                                   [](bool submitted) { return submitted; }) and
+                       "A streaming lane return was already submitted");
+        EP_HOST_ASSERT(lane_output.dim() == 3 and lane_output.is_cuda() and
+                       lane_output.is_contiguous() and
+                       lane_output.scalar_type() == torch::kBFloat16);
+        EP_HOST_ASSERT(lane_output.size(0) == latest_streaming_num_ranks and
+                       lane_output.size(1) == latest_streaming_lane_route_capacity and
+                       lane_output.size(2) == latest_streaming_packed_x->size(1));
+        EP_HOST_ASSERT(src_metadata.dim() == 2 and src_metadata.is_cuda() and
+                       src_metadata.is_contiguous() and
+                       src_metadata.scalar_type() == torch::kInt);
+        EP_HOST_ASSERT(src_metadata.size(0) % latest_streaming_num_ranks == 0);
+        const int num_topk = src_metadata.size(1) - 2;
+        const int num_max_tokens_per_rank =
+            src_metadata.size(0) / latest_streaming_num_ranks;
+        EP_HOST_ASSERT(num_topk > 0 and num_max_tokens_per_rank > 0);
+
+        const auto stream = at::cuda::getCurrentCUDAStream();
+        launch_streaming_combine_return(
+            lane_output.data_ptr(), src_metadata.data_ptr<int>(),
+            latest_streaming_packed_lane_control->data_ptr<int>(),
+            0, latest_streaming_lane_route_capacity,
+            nccl_context->dev_comm, nccl_context->window,
+            latest_streaming_return_buffer, workspace,
+            -1, nccl_context->scaleup_rank_idx, generation,
+            latest_streaming_num_ranks, lane_output.size(2),
+            num_max_tokens_per_rank,
+            latest_streaming_num_ranks * latest_streaming_num_local_experts,
+            num_topk, nccl_context->num_allocated_qps,
+            num_gpu_timeout_cycles, true, stream);
+        lane_output.record_stream(stream);
+        src_metadata.record_stream(stream);
+        latest_streaming_packed_lane_control->record_stream(stream);
+        for (int source_rank_idx = 0;
+             source_rank_idx < latest_streaming_num_ranks;
+             ++source_rank_idx) {
+            streaming_lane_return_events[source_rank_idx] = EventHandle(stream);
+            streaming_lane_return_submitted[source_rank_idx] = true;
+        }
     }
 
     std::tuple<torch::Tensor, EventHandle> streaming_combine_reduce(
@@ -1614,6 +1679,20 @@ public:
                 {nccl_context->num_ranks, 2 + num_local_experts},
                 torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
+            // Small dispatches do not amortize a wide CTA, while full DSV4
+            // prefill chunks are limited by the source-lane copy. The local
+            // token count is available without reading remote metadata and is
+            // a stable proxy for selecting the copy width on every rank.
+            const int configured_streaming_copy_warps =
+                get_env<int>("EP_STREAMING_DISPATCH_COPY_WARPS", 0);
+            const int streaming_copy_warp_min_tokens =
+                get_env<int>("EP_STREAMING_DISPATCH_COPY_WARP_MIN_TOKENS", 1152);
+            EP_HOST_ASSERT(configured_streaming_copy_warps >= 0 and
+                           streaming_copy_warp_min_tokens > 0);
+            const int streaming_copy_warps = configured_streaming_copy_warps != 0
+                ? configured_streaming_copy_warps
+                : (num_tokens >= streaming_copy_warp_min_tokens ? 16 : 2);
+
             launch_dispatch_streaming_copy(
                 buffer, workspace,
                 streaming_packed_x->mutable_data_ptr(),
@@ -1631,6 +1710,7 @@ public:
                 num_experts, num_topk,
                 jit::device_runtime->get_num_smem_bytes(),
                 num_gpu_timeout_cycles,
+                streaming_copy_warps,
                 streaming_lane_copy_streams);
 
             // Every source stream touches a disjoint slice of every packed
@@ -1993,6 +2073,7 @@ static void register_apis(pybind11::module_& m) {
         .def("release_streaming_lane", &ElasticBuffer::release_streaming_lane)
         .def("release_streaming_lane_view", &ElasticBuffer::release_streaming_lane_view)
         .def("streaming_combine_return", &ElasticBuffer::streaming_combine_return)
+        .def("streaming_combine_return_many", &ElasticBuffer::streaming_combine_return_many)
         .def("streaming_combine_reduce", &ElasticBuffer::streaming_combine_reduce)
         .def("get_physical_domain_size", &ElasticBuffer::get_physical_domain_size)
         .def("get_logical_domain_size", &ElasticBuffer::get_logical_domain_size)

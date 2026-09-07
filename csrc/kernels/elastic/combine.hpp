@@ -352,6 +352,7 @@ static void launch_streaming_combine_return(
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk, const int& num_qps,
     const int64_t& num_timeout_cycles,
+    const bool& return_all_sources,
     const at::cuda::CUDAStream& stream) {
     const int default_num_blocks =
         num_qps >= 4 * num_ranks ? 4 :
@@ -364,6 +365,9 @@ static void launch_streaming_combine_return(
         hidden * sizeof(nv_bfloat16), 0, num_topk, false);
     const auto num_smem_bytes =
         kNumWarps * token_layout.get_num_bytes<true>();
+    EP_HOST_ASSERT(not return_all_sources or source_rank_idx == -1);
+    const int grid_blocks =
+        num_blocks * (return_all_sources ? num_ranks : 1);
     const StreamingCombineReturnRuntime::Args args = {
         .num_blocks = num_blocks,
         .num_warps = kNumWarps,
@@ -387,7 +391,7 @@ static void launch_streaming_combine_return(
         .destination_rank_idx = destination_rank_idx,
         .generation = generation,
         .launch_args = jit::LaunchArgs(
-            num_blocks, kNumWarps * 32, num_smem_bytes),
+            grid_blocks, kNumWarps * 32, num_smem_bytes),
     };
     const auto runtime = jit::compiler->build(
         "streaming_combine_return", StreamingCombineReturnRuntime::generate(args));

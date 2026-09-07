@@ -585,6 +585,17 @@ class ElasticBuffer:
             lane_output, lane_src_metadata, source_rank, generation
         )
 
+    def streaming_combine_return_many(
+        self,
+        lane_output: torch.Tensor,
+        src_metadata: torch.Tensor,
+        generation: int,
+    ) -> None:
+        """Return every ready source lane with one multi-source kernel grid."""
+        self.runtime.streaming_combine_return_many(
+            lane_output, src_metadata, generation
+        )
+
     def streaming_combine_reduce(
         self,
         topk_idx: torch.Tensor,

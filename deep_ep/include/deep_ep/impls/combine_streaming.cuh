@@ -40,9 +40,27 @@ combine_streaming_return_impl(
     const auto thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx();
     const auto lane_idx = ptx::get_lane_idx();
-    EP_DEVICE_ASSERT(blockIdx.x < kNumBlocks);
-    EP_DEVICE_ASSERT(0 <= source_rank_idx and source_rank_idx < kNumRanks);
+    const bool batched_sources = source_rank_idx < 0;
+    const int source_rank = batched_sources
+        ? static_cast<int>(blockIdx.x) / kNumBlocks
+        : source_rank_idx;
+    const int return_block_idx = batched_sources
+        ? static_cast<int>(blockIdx.x) % kNumBlocks
+        : static_cast<int>(blockIdx.x);
+    EP_DEVICE_ASSERT(blockIdx.x <
+                     (batched_sources ? kNumRanks * kNumBlocks : kNumBlocks));
+    EP_DEVICE_ASSERT(0 <= source_rank and source_rank < kNumRanks);
     EP_DEVICE_ASSERT(0 <= destination_rank_idx and destination_rank_idx < kNumRanks);
+    constexpr int kMetadataStride = 2 + kNumTopk;
+    constexpr int kLaneControlStride = 2 + kNumExperts / kNumRanks;
+    if (batched_sources) {
+        lane_output += source_rank * lane_capacity * kHidden;
+        lane_src_metadata +=
+            source_rank * kNumMaxTokensPerRank * kMetadataStride;
+        lane_counts += source_rank * kLaneControlStride;
+    }
+    const int effective_lane_base_row =
+        batched_sources ? source_rank * lane_capacity : lane_base_row;
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
     const auto tma_buffer = layout::BufferLayout<true>(
@@ -64,18 +82,18 @@ combine_streaming_return_impl(
     // waits for this source's previous reduction acknowledgement, initializes
     // destination-local grid completion, then releases the remaining CTAs.
     auto* launch_control =
-        workspace_layout.get_streaming_return_launch_control_ptr(source_rank_idx);
+        workspace_layout.get_streaming_return_launch_control_ptr(source_rank);
     if (thread_idx == 0) {
-        if (blockIdx.x == 0) {
+        if (return_block_idx == 0) {
             if (generation > 1) {
                 const auto* ack_control =
-                    workspace_layout.get_streaming_return_control_ptr(source_rank_idx);
+                    workspace_layout.get_streaming_return_control_ptr(source_rank);
                 comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
                     if (streaming::acquire_return_ack(ack_control, generation - 1))
                         return true;
                     if (is_last_check) {
                         printf("DeepEP streaming return reuse timeout, dst: %d, src: %d, expected generation: %llu, observed: %llu\n",
-                               destination_rank_idx, source_rank_idx,
+                               destination_rank_idx, source_rank,
                                static_cast<unsigned long long>(generation - 1),
                                static_cast<unsigned long long>(
                                    ptx::ld_acquire_sys(&ack_control->ack_seq)));
@@ -95,7 +113,7 @@ combine_streaming_return_impl(
     // enough QPs exist. get_qp_mode safely falls back to GPU sharing otherwise.
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumRanks * kNumBlocks, kNumQPs, kNumWarps>(
-            source_rank_idx * kNumBlocks + static_cast<int>(blockIdx.x), warp_idx);
+            source_rank * kNumBlocks + return_block_idx, warp_idx);
     const auto gin = handle::NCCLGin(
         nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
@@ -103,13 +121,13 @@ combine_streaming_return_impl(
     // reduce can make progress.  Avoid scanning every source token and
     // setting up the TMA/NVLink data path when there is nothing to return.
     if (num_source_routes == 0) {
-        if (thread_idx == 0 and blockIdx.x == 0) {
+        if (thread_idx == 0 and return_block_idx == 0) {
             ptx::fence_acq_rel_sys();
             auto* local_control =
                 workspace_layout.get_streaming_return_control_ptr(
                     destination_rank_idx);
             auto* remote_control = gin.get_sym_ptr<ncclTeamTagLsa>(
-                local_control, source_rank_idx);
+                local_control, source_rank);
             EP_DEVICE_ASSERT(remote_control != nullptr);
             ptx::st_relaxed_sys(&remote_control->generation, generation);
             streaming::publish_return_ready(remote_control, generation, 0);
@@ -122,18 +140,18 @@ combine_streaming_return_impl(
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
-    constexpr int kMetadataStride = 2 + kNumTopk;
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
     constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
-    for (int token_idx = static_cast<int>(blockIdx.x) * kNumWarps + warp_idx;
+    for (int token_idx = return_block_idx * kNumWarps + warp_idx;
          token_idx < num_source_tokens;
          token_idx += kNumBlocks * kNumWarps) {
         const auto metadata = lane_src_metadata + token_idx * kMetadataStride;
         const int source_token_idx = __ldg(metadata) % kNumMaxTokensPerRank;
         int stored_row = lane_idx < kNumTopk ? __ldg(metadata + 2 + lane_idx) : -1;
         const bool valid =
-            lane_base_row <= stored_row and stored_row < lane_base_row + lane_capacity;
+            effective_lane_base_row <= stored_row and
+            stored_row < effective_lane_base_row + lane_capacity;
         const auto valid_mask = ptx::gather(valid);
         if (not valid_mask)
             continue;
@@ -142,7 +160,7 @@ combine_streaming_return_impl(
         compute_topk_slots(
             route_rows, valid_mask,
             [=](const int& idx) {
-                return ptx::exchange(stored_row, idx) - lane_base_row;
+                return ptx::exchange(stored_row, idx) - effective_lane_base_row;
             });
         combine_reduce<kHiddenVec, kUnrollFactor, kNumTopk>(
             lane_idx, route_rows,
@@ -162,7 +180,7 @@ combine_streaming_return_impl(
         auto remote_token = recv_buffer.get_rank_buffer(destination_rank_idx)
             .get_token_buffer(source_token_idx);
         remote_token.set_base_ptr(gin.get_sym_ptr<ncclTeamTagLsa>(
-            remote_token.get_base_ptr(), source_rank_idx));
+            remote_token.get_base_ptr(), source_rank));
         EP_DEVICE_ASSERT(remote_token.get_base_ptr() != nullptr);
         if (ptx::elect_one_sync()) {
             ptx::tma_store_1d(
@@ -191,7 +209,7 @@ combine_streaming_return_impl(
         auto* local_control = workspace_layout.get_streaming_return_control_ptr(
             destination_rank_idx);
         auto* remote_control = gin.get_sym_ptr<ncclTeamTagLsa>(
-            local_control, source_rank_idx);
+            local_control, source_rank);
         EP_DEVICE_ASSERT(remote_control != nullptr);
         ptx::st_relaxed_sys(&remote_control->generation, generation);
         streaming::publish_return_ready(remote_control, generation, num_source_routes);
