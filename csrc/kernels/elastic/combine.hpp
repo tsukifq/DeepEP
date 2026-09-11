@@ -296,10 +296,15 @@ class StreamingCombineReturnRuntime final :
     public jit::LaunchRuntime<StreamingCombineReturnRuntime> {
 public:
     struct Args {
+        bool merged_output_layout;
+        bool apply_route_weights;
         int num_blocks, num_warps, num_ranks, hidden, num_max_tokens_per_rank;
         int num_experts, num_topk, num_qps;
         int64_t num_timeout_cycles;
         nv_bfloat16* lane_output;
+        nv_bfloat16* merged_output;
+        int* lane_to_merged;
+        float* lane_route_weights;
         int* lane_src_metadata;
         const int* lane_counts;
         int lane_base_row, lane_capacity;
@@ -319,9 +324,11 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_return_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)",          args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
+ )",         args.merged_output_layout,
+             args.apply_route_weights,
+             args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
              args.num_max_tokens_per_rank, args.num_experts, args.num_topk,
              args.num_qps, args.num_timeout_cycles);
     }
@@ -332,7 +339,8 @@ static void __instantiate_kernel() {{
         Args args) {
         EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
             kernel, config,
-            args.lane_output, args.lane_src_metadata, args.lane_counts,
+            args.lane_output, args.merged_output, args.lane_to_merged,
+            args.lane_route_weights, args.lane_src_metadata, args.lane_counts,
             args.lane_base_row, args.lane_capacity,
             args.nccl_dev_comm, args.nccl_window,
             args.buffer, args.workspace,
@@ -343,6 +351,10 @@ static void __instantiate_kernel() {{
 
 static void launch_streaming_combine_return(
     void* lane_output, int* lane_src_metadata, const int* lane_counts,
+    void* merged_output, int* lane_to_merged,
+    float* lane_route_weights,
+    const bool& merged_output_layout,
+    const bool& apply_route_weights,
     const int& lane_base_row, const int& lane_capacity,
     const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
     void* buffer, void* workspace,
@@ -369,6 +381,8 @@ static void launch_streaming_combine_return(
     const int grid_blocks =
         num_blocks * (return_all_sources ? num_ranks : 1);
     const StreamingCombineReturnRuntime::Args args = {
+        .merged_output_layout = merged_output_layout,
+        .apply_route_weights = apply_route_weights,
         .num_blocks = num_blocks,
         .num_warps = kNumWarps,
         .num_ranks = num_ranks,
@@ -379,6 +393,9 @@ static void launch_streaming_combine_return(
         .num_qps = num_qps,
         .num_timeout_cycles = num_timeout_cycles,
         .lane_output = static_cast<nv_bfloat16*>(lane_output),
+        .merged_output = static_cast<nv_bfloat16*>(merged_output),
+        .lane_to_merged = lane_to_merged,
+        .lane_route_weights = lane_route_weights,
         .lane_src_metadata = lane_src_metadata,
         .lane_counts = lane_counts,
         .lane_base_row = lane_base_row,
@@ -394,14 +411,70 @@ static void launch_streaming_combine_return(
             grid_blocks, kNumWarps * 32, num_smem_bytes),
     };
     const auto runtime = jit::compiler->build(
-        "streaming_combine_return", StreamingCombineReturnRuntime::generate(args));
+        merged_output_layout
+            ? (apply_route_weights
+                   ? "streaming_combine_return_merged"
+                   : "streaming_combine_return_merged_preweighted")
+            : "streaming_combine_return",
+        StreamingCombineReturnRuntime::generate(args));
     StreamingCombineReturnRuntime::launch(runtime, args, stream);
+}
+
+class StreamingCombineWaitReadyRuntime final :
+    public jit::LaunchRuntime<StreamingCombineWaitReadyRuntime> {
+public:
+    struct Args {
+        int num_ranks, num_experts;
+        void* workspace;
+        uint64_t generation;
+        jit::LaunchArgs launch_args;
+    };
+
+    static std::string generate_impl(const Args& args) {
+        return fmt::format(R"(
+#include <deep_ep/impls/combine_streaming.cuh>
+
+using namespace deep_ep::elastic;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_wait_ready_impl<{}, {}>);
+}}
+)",          args.num_ranks, args.num_experts);
+    }
+
+    static void launch_impl(
+        const jit::KernelHandle& kernel,
+        const jit::LaunchConfigHandle& config,
+        Args args) {
+        EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+            kernel, config, args.workspace, args.generation));
+    }
+};
+
+static void launch_streaming_combine_wait_ready(
+    void* workspace,
+    const uint64_t& generation,
+    const int& num_ranks,
+    const int& num_experts,
+    const at::cuda::CUDAStream& stream) {
+    const StreamingCombineWaitReadyRuntime::Args args = {
+        .num_ranks = num_ranks,
+        .num_experts = num_experts,
+        .workspace = workspace,
+        .generation = generation,
+        .launch_args = jit::LaunchArgs(1, 32, 0),
+    };
+    const auto runtime = jit::compiler->build(
+        "streaming_combine_wait_ready",
+        StreamingCombineWaitReadyRuntime::generate(args));
+    StreamingCombineWaitReadyRuntime::launch(runtime, args, stream);
 }
 
 class StreamingCombineReduceRuntime final :
     public jit::LaunchRuntime<StreamingCombineReduceRuntime> {
 public:
     struct Args {
+        bool wait_for_returns;
         int num_blocks, num_warps, num_ranks, hidden, num_max_tokens_per_rank;
         int num_experts, num_topk;
         nv_bfloat16* combined_x;
@@ -423,9 +496,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_streaming_reduce_impl<{}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_streaming_reduce_impl<{}, {}, {}, {}, {}, {}, {}, {}>);
 }}
-)",          args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
+)",          args.wait_for_returns,
+             args.num_blocks, args.num_warps, args.num_ranks, args.hidden,
              args.num_max_tokens_per_rank, args.num_experts, args.num_topk);
     }
 
@@ -453,6 +527,8 @@ static void launch_streaming_combine_reduce(
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const at::cuda::CUDAStream& stream) {
+    const bool sync_reduce =
+        get_env<int>("EP_EXPERIMENTAL_STREAMING_SYNC_REDUCE", 0) != 0;
     const int num_blocks = get_env<int>(
         "EP_STREAMING_COMBINE_REDUCE_BLOCKS", 4);
     EP_HOST_ASSERT(1 <= num_blocks and num_blocks <= 16);
@@ -461,7 +537,13 @@ static void launch_streaming_combine_reduce(
         hidden * sizeof(nv_bfloat16), 0, 0, false);
     const auto num_smem_bytes =
         kNumWarps * output_layout.get_num_bytes<false>();
+    if (sync_reduce) {
+        launch_streaming_combine_wait_ready(
+            workspace, generation, num_ranks, num_experts, stream);
+    }
+
     const StreamingCombineReduceRuntime::Args args = {
+        .wait_for_returns = not sync_reduce,
         .num_blocks = num_blocks,
         .num_warps = kNumWarps,
         .num_ranks = num_ranks,
@@ -482,7 +564,9 @@ static void launch_streaming_combine_reduce(
             num_blocks, kNumWarps * 32, num_smem_bytes),
     };
     const auto runtime = jit::compiler->build(
-        "streaming_combine_reduce", StreamingCombineReduceRuntime::generate(args));
+        sync_reduce ? "streaming_combine_reduce_ready" :
+                      "streaming_combine_reduce",
+        StreamingCombineReduceRuntime::generate(args));
     StreamingCombineReduceRuntime::launch(runtime, args, stream);
 }
 

@@ -596,6 +596,25 @@ class ElasticBuffer:
             lane_output, src_metadata, generation
         )
 
+    def streaming_combine_return_many_merged(
+        self,
+        merged_output: torch.Tensor,
+        lane_to_merged: torch.Tensor,
+        lane_route_weights: torch.Tensor,
+        src_metadata: torch.Tensor,
+        apply_route_weights: bool,
+        generation: int,
+    ) -> None:
+        """Return every source directly from rank-merged weighted routes."""
+        self.runtime.streaming_combine_return_many_merged(
+            merged_output,
+            lane_to_merged,
+            lane_route_weights,
+            src_metadata,
+            apply_route_weights,
+            generation,
+        )
+
     def streaming_combine_reduce(
         self,
         topk_idx: torch.Tensor,

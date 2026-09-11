@@ -11,10 +11,137 @@
 
 namespace deep_ep::elastic {
 
+template <typename vec_t>
+__device__ __forceinline__
+vec_t scale_bf16_vector(vec_t value, const float weight) {
+    constexpr int kNumPairs = sizeof(vec_t) / sizeof(nv_bfloat162);
+    auto* pairs = reinterpret_cast<nv_bfloat162*>(&value);
+    #pragma unroll
+    for (int i = 0; i < kNumPairs; ++ i) {
+        auto values = __bfloat1622float2(pairs[i]);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+        values = __fmul2_rn(values, {weight, weight});
+#else
+        values.x *= weight;
+        values.y *= weight;
+#endif
+        pairs[i] = __float22bfloat162_rn(values);
+    }
+    return value;
+}
+
+// Match the existing scatter -> return numerical boundary while loading
+// directly from rank-merged W2 rows: each route is weighted and rounded to
+// BF16 before routes for one source token are accumulated.
+template <int kHiddenVec, int kUnrollFactor, int kNumExpectedTopk,
+          int kNumValidTopk, typename vec_t,
+          typename get_src_buffer_ptr_func_t, typename wait_buffer_func_t>
+__device__ __forceinline__
+void combine_reduce_weighted(
+    const int lane_idx,
+    int (&topk_slot_idx)[kNumValidTopk],
+    float (&topk_weights)[kNumValidTopk],
+    vec_t* dst_buffer_ptr,
+    const get_src_buffer_ptr_func_t& get_src_buffer_ptr_func,
+    const wait_buffer_func_t& wait_buffer_func) {
+    constexpr int kNumElemsPerVec = sizeof(vec_t) / sizeof(nv_bfloat16);
+    EP_STATIC_ASSERT(kNumElemsPerVec % 2 == 0, "Invalid number of elements");
+    EP_STATIC_ASSERT(kHiddenVec % (kUnrollFactor * 32) == 0, "Invalid unrolling");
+    EP_STATIC_ASSERT(kNumValidTopk > 0, "Invalid top-k");
+    const bool enable_hadd_bypass =
+        kNumValidTopk <= 2 or topk_slot_idx[2] < 0;
+
+    if (enable_hadd_bypass) {
+        #pragma unroll 1
+        for (int i = 0; i < kHiddenVec / (kUnrollFactor * 32); ++ i) {
+            const auto slot_0 = topk_slot_idx[0];
+            const auto src_base_ptr_0 = get_src_buffer_ptr_func(slot_0);
+            vec_t values_0[kUnrollFactor] = {};
+            #pragma unroll
+            for (int j = 0; j < kUnrollFactor; ++ j) {
+                values_0[j] = ptx::ldg_with_gez_pred(
+                    src_base_ptr_0 +
+                        (i * (kUnrollFactor * 32) + j * 32 + lane_idx),
+                    slot_0);
+                values_0[j] = scale_bf16_vector(values_0[j], topk_weights[0]);
+            }
+
+            const auto slot_1 = kNumValidTopk == 1 ? -1 : topk_slot_idx[1];
+            const auto src_base_ptr_1 = get_src_buffer_ptr_func(slot_1);
+            vec_t values_1[kUnrollFactor] = {};
+            #pragma unroll
+            for (int j = 0; j < kUnrollFactor; ++ j) {
+                values_1[j] = ptx::ldg_with_gez_pred(
+                    src_base_ptr_1 +
+                        (i * (kUnrollFactor * 32) + j * 32 + lane_idx),
+                    slot_1);
+                values_1[j] = scale_bf16_vector(values_1[j], topk_weights[1]);
+            }
+
+            if (i == 0)
+                wait_buffer_func();
+            auto* bf162_view_0 = reinterpret_cast<nv_bfloat162*>(values_0);
+            const auto* bf162_view_1 = reinterpret_cast<nv_bfloat162*>(values_1);
+            #pragma unroll
+            for (int j = 0; j < kUnrollFactor; ++ j) {
+                #pragma unroll
+                for (int l = 0; l < kNumElemsPerVec / 2; ++ l)
+                    bf162_view_0[j * (kNumElemsPerVec / 2) + l] +=
+                        bf162_view_1[j * (kNumElemsPerVec / 2) + l];
+                dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] =
+                    values_0[j];
+            }
+        }
+    } else {
+        #pragma unroll 1
+        for (int i = 0; i < kHiddenVec / (kUnrollFactor * 32); ++ i) {
+            float2 reduced[kUnrollFactor * kNumElemsPerVec / 2] = {};
+            #pragma unroll
+            for (int k = 0; k < kNumValidTopk; ++ k) {
+                if (k >= kNumExpectedTopk and topk_slot_idx[k] < 0)
+                    break;
+                const auto src_base_ptr =
+                    get_src_buffer_ptr_func(topk_slot_idx[k]);
+                vec_t values[kUnrollFactor] = {};
+                #pragma unroll
+                for (int j = 0; j < kUnrollFactor; ++ j) {
+                    values[j] = ptx::ldg_with_gez_pred(
+                        src_base_ptr +
+                            (i * (kUnrollFactor * 32) + j * 32 + lane_idx),
+                        topk_slot_idx[k]);
+                    values[j] = scale_bf16_vector(values[j], topk_weights[k]);
+                }
+                const auto* bf162_view =
+                    reinterpret_cast<const nv_bfloat162*>(values);
+                #pragma unroll
+                for (int j = 0;
+                     j < kUnrollFactor * kNumElemsPerVec / 2; ++ j)
+                    ptx::accumulate(reduced[j], bf162_view[j]);
+            }
+            if (i == 0)
+                wait_buffer_func();
+            #pragma unroll
+            for (int j = 0; j < kUnrollFactor; ++ j) {
+                vec_t casted_value;
+                auto* bf162_view =
+                    reinterpret_cast<nv_bfloat162*>(&casted_value);
+                #pragma unroll
+                for (int l = 0; l < kNumElemsPerVec / 2; ++ l)
+                    bf162_view[l] = __float22bfloat162_rn(
+                        reduced[j * (kNumElemsPerVec / 2) + l]);
+                dst_buffer_ptr[i * (kUnrollFactor * 32) + j * 32 + lane_idx] =
+                    casted_value;
+            }
+        }
+    }
+}
+
 // Return path for one ready (source, destination) route batch. Token rows are
 // sharded across a small grid, without an all-rank barrier. The last CTA
 // publishes only the source's destination-indexed return doorbell.
-template <int kNumBlocks,
+template <bool kMergedOutput,
+          bool kApplyRouteWeights,
+          int kNumBlocks,
           int kNumWarps,
           int kNumRanks,
           int kHidden,
@@ -26,6 +153,9 @@ template <int kNumBlocks,
 __global__ void __launch_bounds__(kNumThreads, 1)
 combine_streaming_return_impl(
     nv_bfloat16* lane_output,
+    nv_bfloat16* merged_output,
+    int* lane_to_merged,
+    float* lane_route_weights,
     int* lane_src_metadata,
     const int* lane_counts,
     const int lane_base_row,
@@ -47,6 +177,8 @@ combine_streaming_return_impl(
     const int return_block_idx = batched_sources
         ? static_cast<int>(blockIdx.x) % kNumBlocks
         : static_cast<int>(blockIdx.x);
+    if constexpr (kMergedOutput)
+        EP_DEVICE_ASSERT(batched_sources);
     EP_DEVICE_ASSERT(blockIdx.x <
                      (batched_sources ? kNumRanks * kNumBlocks : kNumBlocks));
     EP_DEVICE_ASSERT(0 <= source_rank and source_rank < kNumRanks);
@@ -54,7 +186,8 @@ combine_streaming_return_impl(
     constexpr int kMetadataStride = 2 + kNumTopk;
     constexpr int kLaneControlStride = 2 + kNumExperts / kNumRanks;
     if (batched_sources) {
-        lane_output += source_rank * lane_capacity * kHidden;
+        if constexpr (not kMergedOutput)
+            lane_output += source_rank * lane_capacity * kHidden;
         lane_src_metadata +=
             source_rank * kNumMaxTokensPerRank * kMetadataStride;
         lane_counts += source_rank * kLaneControlStride;
@@ -157,23 +290,79 @@ combine_streaming_return_impl(
             continue;
 
         int route_rows[kNumTopk];
-        compute_topk_slots(
-            route_rows, valid_mask,
-            [=](const int& idx) {
-                return ptx::exchange(stored_row, idx) - effective_lane_base_row;
-            });
-        combine_reduce<kHiddenVec, kUnrollFactor, kNumTopk>(
-            lane_idx, route_rows,
-            static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
-            [=](const int& row) {
-                return math::advance_ptr<combine_vec_t>(
-                    lane_output,
-                    row * static_cast<int64_t>(kNumHiddenBytes));
-            },
-            [=]() {
-                ptx::tma_store_wait();
-                __syncwarp();
-            });
+        if constexpr (kMergedOutput) {
+            auto remaining = valid_mask;
+            #pragma unroll
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const int lowest_idx = __ffs(remaining) - 1;
+                const int lane_row =
+                    ptx::exchange(stored_row, lowest_idx) -
+                    effective_lane_base_row;
+                remaining &= remaining - 1;
+                route_rows[k] = lowest_idx >= 0
+                    ? __ldg(lane_to_merged +
+                            source_rank * lane_capacity + lane_row)
+                    : -1;
+            }
+            if constexpr (kApplyRouteWeights) {
+                float route_weights[kNumTopk];
+                auto weight_mask = valid_mask;
+                #pragma unroll
+                for (int k = 0; k < kNumTopk; ++ k) {
+                    const int lowest_idx = __ffs(weight_mask) - 1;
+                    const int lane_row =
+                        ptx::exchange(stored_row, lowest_idx) -
+                        effective_lane_base_row;
+                    weight_mask &= weight_mask - 1;
+                    route_weights[k] = lowest_idx >= 0
+                        ? __ldg(lane_route_weights +
+                                source_rank * lane_capacity + lane_row)
+                        : 0.0f;
+                }
+                combine_reduce_weighted<
+                    kHiddenVec, kUnrollFactor, kNumTopk, kNumTopk>(
+                    lane_idx, route_rows, route_weights,
+                    static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                    [=](const int& row) {
+                        return math::advance_ptr<combine_vec_t>(
+                            merged_output,
+                            row * static_cast<int64_t>(kNumHiddenBytes));
+                    },
+                    [=]() {
+                        ptx::tma_store_wait();
+                        __syncwarp();
+                    });
+            } else {
+                combine_reduce<kHiddenVec, kUnrollFactor, kNumTopk>(
+                    lane_idx, route_rows,
+                    static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                    [=](const int& row) {
+                        return math::advance_ptr<combine_vec_t>(
+                            merged_output,
+                            row * static_cast<int64_t>(kNumHiddenBytes));
+                    },
+                    [=]() { ptx::tma_store_wait(); __syncwarp(); });
+            }
+        } else {
+            compute_topk_slots(
+                route_rows, valid_mask,
+                [=](const int& idx) {
+                    return ptx::exchange(stored_row, idx) -
+                        effective_lane_base_row;
+                });
+            combine_reduce<kHiddenVec, kUnrollFactor, kNumTopk>(
+                lane_idx, route_rows,
+                static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                [=](const int& row) {
+                    return math::advance_ptr<combine_vec_t>(
+                        lane_output,
+                        row * static_cast<int64_t>(kNumHiddenBytes));
+                },
+                [=]() {
+                    ptx::tma_store_wait();
+                    __syncwarp();
+                });
+        }
         ptx::tma_store_fence();
         __syncwarp();
 
@@ -216,11 +405,39 @@ combine_streaming_return_impl(
     }
 }
 
-// Source-local reduction waits for this source's destination returns only.
+// Hybrid combine readiness gate. Keep asynchronous per-destination returns,
+// but do not start the reduction grid until every owner has published its
+// return slot. A single CTA performs the remote polling and initializes the
+// generation-local completion state; the following reduce-only launch is
+// ordered after this kernel on the same CUDA stream.
+template <int kNumRanks, int kNumExperts>
+__global__ void __launch_bounds__(32, 1)
+combine_streaming_wait_ready_impl(
+    void* workspace,
+    const uint64_t generation) {
+    if (threadIdx.x != 0)
+        return;
+
+    const auto workspace_layout = layout::WorkspaceLayout(
+        workspace, 1, kNumRanks, kNumExperts);
+    for (int destination = 0; destination < kNumRanks; ++ destination) {
+        const auto* control =
+            workspace_layout.get_streaming_return_control_ptr(destination);
+        while (not streaming::acquire_return_ready(control, generation)) {}
+    }
+    auto* layer_control = workspace_layout.get_streaming_layer_control_ptr();
+    ptx::st_relaxed_sys(&layer_control->reduce_completed_blocks, 0u);
+    ptx::st_release_sys(&layer_control->reduce_generation, generation);
+}
+
+// Source-local reduction consumes this source's destination return slots.
+// The legacy variant waits and initializes completion state in block zero;
+// the hybrid variant is launched after combine_streaming_wait_ready_impl.
 // Token rows are sharded over a small grid. A generation-tagged completion
 // counter lets the last CTA publish source completion without a cooperative
 // launch or a second kernel.
-template <int kNumBlocks,
+template <bool kWaitForReturns,
+          int kNumBlocks,
           int kNumWarps,
           int kNumRanks,
           int kHidden,
@@ -247,21 +464,23 @@ combine_streaming_reduce_impl(
     const auto workspace_layout = layout::WorkspaceLayout(
         workspace, 1, kNumRanks, kNumExperts);
     auto* layer_control = workspace_layout.get_streaming_layer_control_ptr();
-    if (thread_idx == 0) {
-        if (blockIdx.x == 0) {
-            for (int destination = 0; destination < kNumRanks; ++ destination) {
-                const auto* control =
-                    workspace_layout.get_streaming_return_control_ptr(destination);
-                while (not streaming::acquire_return_ready(control, generation)) {}
+    if constexpr (kWaitForReturns) {
+        if (thread_idx == 0) {
+            if (blockIdx.x == 0) {
+                for (int destination = 0; destination < kNumRanks; ++ destination) {
+                    const auto* control =
+                        workspace_layout.get_streaming_return_control_ptr(destination);
+                    while (not streaming::acquire_return_ready(control, generation)) {}
+                }
+                ptx::st_relaxed_sys(&layer_control->reduce_completed_blocks, 0u);
+                ptx::st_release_sys(&layer_control->reduce_generation, generation);
+            } else {
+                while (ptx::ld_acquire_sys(&layer_control->reduce_generation) !=
+                       generation) {}
             }
-            ptx::st_relaxed_sys(&layer_control->reduce_completed_blocks, 0u);
-            ptx::st_release_sys(&layer_control->reduce_generation, generation);
-        } else {
-            while (ptx::ld_acquire_sys(&layer_control->reduce_generation) !=
-                   generation) {}
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto comm_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
